@@ -1,0 +1,18 @@
+# Build
+FROM golang:1.21 AS build
+
+WORKDIR /go/src/tbw
+
+COPY go.mod go.sum .
+RUN go mod download
+ENV CGO_ENABLED=0
+
+COPY . .
+RUN mkdir -p /out
+RUN go build -o /out/tbw ./tbw
+
+# Deploy
+FROM debian:bookworm
+
+COPY --from=build /out/tbw /tbw
+CMD ["/tbw"]

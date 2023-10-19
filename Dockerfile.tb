@@ -1,0 +1,19 @@
+# Build
+FROM golang:1.21 AS build
+
+WORKDIR /go/src/tb
+
+COPY go.mod go.sum .
+RUN go mod download
+ENV CGO_ENABLED=0
+RUN go install tailscale.com/tsnet
+
+COPY . .
+RUN mkdir -p /out
+RUN go build -o /out/tb ./tb
+
+# Deploy
+FROM debian:bookworm
+
+COPY --from=build /out/tb /tb
+CMD ["/tb"]

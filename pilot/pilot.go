@@ -12,7 +12,7 @@ import (
 	"net/http"
 	"net/netip"
 	"os"
-	"os/exec"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"time"
@@ -61,8 +61,9 @@ func main() {
 	flag.Parse()
 
 	c := &Client{
-		App:   *app,
-		Token: strings.TrimSpace(string(must.Get(exec.Command("flyctl", "auth", "token").Output()))),
+		App: *app,
+		//Token: strings.TrimSpace(string(must.Get(exec.Command("flyctl", "auth", "token").Output()))),
+		Token: strings.TrimSpace(string(must.Get(os.ReadFile(filepath.Join(os.Getenv("HOME"), "keys", "fly-ci-token"))))),
 	}
 	ctx := context.Background()
 	machines := must.Get(c.ListMachines(ctx))
@@ -153,6 +154,22 @@ func (c *Client) ListMachines(ctx context.Context) ([]*Machine, error) {
 type StopParam struct {
 	Signal  string
 	Timeout time.Duration
+}
+
+func (c *Client) CloneMachine(ctx context.Context, id MachineID) error {
+	var body any
+	if p := optParam; p != nil {
+		var s struct {
+			Signal  string `json:"signal,omitempty"`
+			Timeout string `json:"timeout,omitempty"`
+		}
+		s.Signal = p.Signal
+		if p.Timeout != 0 {
+			s.Timeout = p.Timeout.String()
+		}
+		body = s
+	}
+	return c.toMachineID(ctx, "POST", id, "/stop", body)
 }
 
 func (c *Client) StopMachine(ctx context.Context, id MachineID, optParam *StopParam) error {

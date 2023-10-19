@@ -1,0 +1,12 @@
+app = "tb"
+primary_region = "sea"
+
+[mounts]
+  source="tb_data"
+  destination="/persist"
+
+[build]
+  dockerfile = "../Dockerfile.tb"
+
+[deploy]
+  strategy = "immediate"
