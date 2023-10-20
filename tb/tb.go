@@ -6,6 +6,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"flag"
@@ -15,6 +16,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -80,18 +82,26 @@ func main() {
 		errc <- fmt.Errorf("tsnet.Serve: %w", http.Serve(ln, http.HandlerFunc(c.ServeTSNet)))
 	}()
 	go func() {
-		errc <- fmt.Errorf("http.Serve: %w", http.ListenAndServe(":8080", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-
-			fmt.Fprintf(w, "Hello, world (from 8080)")
-		})))
+		errc <- fmt.Errorf("http.Serve: %w", http.ListenAndServe(":8080", http.HandlerFunc(c.Serve6PN)))
 	}()
 
 	log.Fatal(<-errc)
 }
 
+// Serve6PN serves 6PN clients (over port 8080 on the Fly private IPv6 network
+// within the org, from the untrusted work app). These requests should be
+// assumed to be suspect.
+func (c *Controller) Serve6PN(w http.ResponseWriter, r *http.Request) {
+	if r.Method == "GET" && r.URL.Path == "/archive" {
+		c.serveArchive(w, r)
+		return
+	}
+}
+
+// ServeTSNet serves tsnet clients (over Tailscale).
 func (c *Controller) ServeTSNet(w http.ResponseWriter, r *http.Request) {
 	if r.Method == "POST" {
-		switch r.RequestURI {
+		switch r.URL.Path {
 		case "/fetch":
 			c.serveFetch(w, r)
 			return
@@ -100,10 +110,12 @@ func (c *Controller) ServeTSNet(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	switch r.RequestURI {
+	switch r.URL.Path {
 	default:
 		http.Error(w, "not found", http.StatusNotFound)
 		return
+	case "/archive":
+		c.serveArchive(w, r)
 	case "/stats":
 		c.serveStats(w, r)
 	case "/":
@@ -165,4 +177,25 @@ func (c *Controller) serveFetch(w http.ResponseWriter, r *http.Request) {
 	res.Hash = strings.TrimSpace(string(out))
 
 	c.serveJSON(w, http.StatusOK, res)
+}
+
+var hashRx = regexp.MustCompile(`^[0-9a-f]{40}$`)
+
+func (c *Controller) serveArchive(w http.ResponseWriter, r *http.Request) {
+	hash := r.FormValue("hash")
+	if !hashRx.MatchString(hash) {
+		http.Error(w, "bad 'hash'; want 40 lowercase hex", http.StatusBadRequest)
+		return
+	}
+	w.Header().Set("Content-Type", "application/gzip")
+	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s.tar.gz"`, hash))
+	cmd := exec.Command("git", "archive", "--format=tar.gz", hash)
+	cmd.Dir = c.gitDir
+	cmd.Stdout = w
+	var errBuf bytes.Buffer
+	cmd.Stderr = &errBuf
+	if err := cmd.Run(); err != nil {
+		http.Error(w, fmt.Sprintf("git archive: %v\n%s", err, errBuf.Bytes()), http.StatusInternalServerError)
+		return
+	}
 }
