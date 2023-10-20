@@ -7,6 +7,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -17,6 +18,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/tailscale/tb/tb/tbtype"
 	"tailscale.com/tsnet"
 	"tailscale.com/util/cmpx"
 	"tailscale.com/util/rands"
@@ -123,10 +125,22 @@ func (c *Controller) serveStats(w http.ResponseWriter, r *http.Request) {
 	w.Write(out)
 }
 
+func (c *Controller) serveJSON(w http.ResponseWriter, statusCode int, v any) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(statusCode)
+	e := json.NewEncoder(w)
+	e.SetIndent("", "\t")
+	e.Encode(v)
+}
+
 func (c *Controller) serveFetch(w http.ResponseWriter, r *http.Request) {
 	ref := r.FormValue("ref")
+	res := &tbtype.FetchResponse{
+		RemoteRef: ref,
+	}
 	if strings.ContainsAny(ref, " \t\n\r\"'|") {
-		http.Error(w, "bad ref", http.StatusBadRequest)
+		res.Error = "bad ref"
+		c.serveJSON(w, http.StatusBadRequest, res)
 		return
 	}
 	localRef := fmt.Sprintf("fetch-ref-%v-%v", time.Now().UnixNano(), rands.HexString(10))
@@ -134,8 +148,21 @@ func (c *Controller) serveFetch(w http.ResponseWriter, r *http.Request) {
 	cmd.Dir = c.gitDir
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		http.Error(w, fmt.Sprintf("git fetch: %v\n%s", err, out), http.StatusInternalServerError)
+		res.Error = fmt.Sprintf("git fetch: %v\n%s", err, out)
+		c.serveJSON(w, http.StatusInternalServerError, res)
 		return
 	}
-	fmt.Fprintf(w, "%s\n", localRef)
+	res.LocalRef = localRef
+
+	cmd = exec.Command("git", "rev-parse", localRef)
+	cmd.Dir = c.gitDir
+	out, err = cmd.CombinedOutput()
+	if err != nil {
+		res.Error = fmt.Sprintf("git rev-parse: %v\n%s", err, out)
+		c.serveJSON(w, http.StatusInternalServerError, res)
+		return
+	}
+	res.Hash = strings.TrimSpace(string(out))
+
+	c.serveJSON(w, http.StatusOK, res)
 }
