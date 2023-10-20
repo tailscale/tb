@@ -160,7 +160,7 @@ func (c *Controller) fetch(ref string) (*tbtype.FetchResponse, error) {
 	if strings.ContainsAny(ref, " \t\n\r\"'|") {
 		return nil, fmt.Errorf("bad ref")
 	}
-	localRef := fmt.Sprintf("fetch-ref-%v-%v", time.Now().UnixNano(), rands.HexString(10))
+	localRef := fmt.Sprintf("tempref-handle-%v-%v", time.Now().UnixNano(), rands.HexString(16))
 	cmd := exec.Command("git", "fetch", "-f", "https://github.com/tailscale/tailscale", ref+":"+localRef)
 	cmd.Dir = c.gitDir
 	out, err := cmd.CombinedOutput()
@@ -193,7 +193,10 @@ func (c *Controller) serveFetch(w http.ResponseWriter, r *http.Request) {
 	c.serveJSON(w, http.StatusOK, res)
 }
 
-var hashRx = regexp.MustCompile(`^[0-9a-f]{40}$`)
+var (
+	hashRx    = regexp.MustCompile(`^[0-9a-f]{40}$`)
+	tempRefRx = regexp.MustCompile(`^tempref-handle-\d+-[0-9a-f]+$`)
+)
 
 func (c *Controller) serveArchive(w http.ResponseWriter, r *http.Request) {
 	hash := r.FormValue("hash")
@@ -201,14 +204,57 @@ func (c *Controller) serveArchive(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad 'hash'; want 40 lowercase hex", http.StatusBadRequest)
 		return
 	}
-	// TODO(bradfitz): also require a local-ref and make sure its rev-parse
-	// matches the hash. The randomness in the local-ref (and that it times out)
-	// then also serves as a time-limited capability token that we give out,
-	// preventing untrusted workers from getting any hash they know about.
+	// We also require a local-ref and make sure its rev-parse matches the hash.
+	// The randomness in the local-ref (and that it times out) then also serves
+	// as a time-limited capability token that we give out, preventing untrusted
+	// workers from getting any hash they know about.
+	ref := r.FormValue("ref")
+	if !tempRefRx.MatchString(ref) {
+		http.Error(w, "bad 'ref'; want a tempref-handle from fetch", http.StatusBadRequest)
+		return
+	}
+
+	cmd := exec.Command("git", "rev-parse", ref)
+	cmd.Dir = c.gitDir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		http.Error(w, fmt.Sprintf("git rev-parse: %v\n%s", err, out), http.StatusInternalServerError)
+		return
+	}
+	if strings.TrimSpace(string(out)) != hash {
+		http.Error(w, "ref handle doesn't match provided hash", http.StatusBadRequest)
+		return
+	}
+
+	// TODO(bradfitz): at this point, check a cache (memory is probably
+	// sufficient, LRU of a dozen tarballs) and see if we've already made this
+	// tarball.
+
+	td, err := os.MkdirTemp("", "tbarchive-*")
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer os.RemoveAll(td)
+
+	shallowClone := filepath.Join(td, "shallow")
+	// git clone --depth=1 --single-branch --branch=foo file:///Users/bradfitz/src/tailscale.com /tmp/git/lil2
+	cmd = exec.Command("git", "clone",
+		"--depth=1",
+		"--single-branch",
+		"--branch="+ref,
+		"file://"+c.gitDir,
+		shallowClone)
+	cmd.Dir = c.gitDir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		http.Error(w, fmt.Sprintf("git clone: %v\n%s", err, out), http.StatusInternalServerError)
+		return
+	}
+
 	w.Header().Set("Content-Type", "application/gzip")
 	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s.tar.gz"`, hash))
-	cmd := exec.Command("git", "archive", "--format=tar.gz", hash)
-	cmd.Dir = c.gitDir
+	cmd = exec.Command("tar", "-zcf", "-", ".")
+	cmd.Dir = shallowClone
 	cmd.Stdout = w
 	var errBuf bytes.Buffer
 	cmd.Stderr = &errBuf
