@@ -15,5 +15,8 @@ RUN go build -o /out/tb ./tb
 # Deploy
 FROM debian:bookworm
 
+RUN apt-get update && apt-get install -y \
+    ca-certificates git curl jq strace
+
 COPY --from=build /out/tb /tb
 CMD ["/tb"]
