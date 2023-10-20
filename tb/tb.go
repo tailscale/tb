@@ -187,6 +187,10 @@ func (c *Controller) serveArchive(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad 'hash'; want 40 lowercase hex", http.StatusBadRequest)
 		return
 	}
+	// TODO(bradfitz): also require a local-ref and make sure its rev-parse
+	// matches the hash. The randomness in the local-ref (and that it times out)
+	// then also serves as a time-limited capability token that we give out,
+	// preventing untrusted workers from getting any hash they know about.
 	w.Header().Set("Content-Type", "application/gzip")
 	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s.tar.gz"`, hash))
 	cmd := exec.Command("git", "archive", "--format=tar.gz", hash)
