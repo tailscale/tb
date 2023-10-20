@@ -36,7 +36,12 @@ import (
 const workDir = "/home/workdir"
 
 func main() {
-	time.AfterFunc(10*time.Hour, shutdownOfLastResort)
+	dur, _ := time.ParseDuration(os.Getenv("VM_MAX_DURATION"))
+	if dur == 0 {
+		dur = 1 * time.Hour
+	}
+
+	time.AfterFunc(dur, shutdownOfLastResort)
 	if os.Getenv("EXIT_ON_START") == "1" {
 		fmt.Println("tb shutting down on start per EXIT_ON_START")
 		return
@@ -52,6 +57,9 @@ func main() {
 	m.HandleFunc("/put", handlePutTarball)
 	m.HandleFunc("/status", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		io.WriteString(w, "OK\n")
+	}))
+	m.HandleFunc("/gen204", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
 	}))
 	m.HandleFunc("/quitquitquit", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != "POST" {
@@ -81,6 +89,10 @@ func test(w http.ResponseWriter, r *http.Request) {
 	cmd.Dir = workDir
 	cmd.Stdout = w
 	cmd.Stderr = w
+	cmd.Env = os.Environ()
+	for _, v := range r.Header["Test-Env"] {
+		cmd.Env = append(cmd.Env, v)
+	}
 	err := cmd.Run()
 	d := time.Since(t0).Round(time.Millisecond)
 	log.Printf("test of %v = %v in %v", pkg, err, d)

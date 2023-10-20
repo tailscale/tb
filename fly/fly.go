@@ -49,12 +49,19 @@ type MachineConfig struct {
 	Env         map[string]string `json:"env,omitempty"`
 	Image       string            `json:"image,omitempty"`
 	Restart     *MachineRestart   `json:"restart,omitempty"`
+	Guest       *MachineGuest     `json:"guest,omitempty"`
 }
 
 type ImageRef struct {
 	Registry   string `json:"registry"`
 	Repository string `json:"repository"`
 	Tag        string `json:"tag"`
+}
+
+type MachineGuest struct {
+	MemoryMB int    `json:"memory_mb,omitempty"`
+	CPUs     int    `json:"cpus,omitempty"`
+	CPUKind  string `json:"cpu_kind,omitempty"` // must be "shared" or "performance"
 }
 
 type Machine struct {
@@ -68,6 +75,7 @@ type Machine struct {
 	Nonce      string         `json:"nonce,omitempty"`
 	Region     string         `json:"region,omitempty"`
 	PrivateIP  *netip.Addr    `json:"private_ip,omitempty"`
+	CreatedAt  string         `json:"created_at,omitempty"`
 }
 
 type CreateMachineRequest struct {
