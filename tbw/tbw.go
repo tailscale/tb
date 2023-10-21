@@ -157,11 +157,13 @@ func handlePutTarball(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	t1 := time.Now()
 	err := untar(tgz, baseDir)
 	if err != nil {
 		http.Error(w, err.Error(), httpStatus(err))
 		return
 	}
+	log.Printf("writetgz: wrote tar post-headers in %v", time.Since(t1))
 	io.WriteString(w, "OK")
 }
 

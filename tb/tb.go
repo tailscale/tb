@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"html"
 	"io"
 	"log"
 	"net/http"
@@ -20,20 +21,24 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/tailscale/tb/fly"
 	"github.com/tailscale/tb/tb/tbtype"
+	"tailscale.com/syncs"
 	"tailscale.com/tsnet"
 	"tailscale.com/types/logger"
 	"tailscale.com/util/cmpx"
+	"tailscale.com/util/mak"
 	"tailscale.com/util/rands"
 )
 
 var (
-	stateDir  = flag.String("state", "/persist/tsnet", "state directory")
-	cacheDir  = flag.String("cache", "/persist/cache", "cache directory")
-	workerApp = flag.String("worker-app", cmpx.Or(os.Getenv("TB_WORKER_APP"), "tb-no-secrets"), "the untrusted, secret-less Fly app in which to create machines for CI builds")
+	stateDir    = flag.String("state", "/persist/tsnet", "state directory")
+	cacheDir    = flag.String("cache", "/persist/cache", "cache directory")
+	workerApp   = flag.String("worker-app", cmpx.Or(os.Getenv("TB_WORKER_APP"), "tb-no-secrets"), "the untrusted, secret-less Fly app in which to create machines for CI builds")
+	maxMachines = flag.Int("max-machines", 500, "maximum number of machines to have running at once")
 )
 
 type Controller struct {
@@ -41,6 +46,12 @@ type Controller struct {
 	gitDir    string // under cache
 
 	ts *tsnet.Server
+	fc *fly.Client
+
+	machineSem syncs.Semaphore
+
+	mu   sync.Mutex
+	runs map[string]*Run
 }
 
 func main() {
@@ -50,8 +61,13 @@ func main() {
 	}
 
 	c := &Controller{
-		cacheRoot: *cacheDir,
-		gitDir:    filepath.Join(*cacheDir, "git"),
+		cacheRoot:  *cacheDir,
+		gitDir:     filepath.Join(*cacheDir, "git"),
+		machineSem: syncs.NewSemaphore(*maxMachines),
+		fc: &fly.Client{
+			App:   *workerApp,
+			Token: os.Getenv("FLY_TOKEN"),
+		},
 	}
 
 	if err := os.MkdirAll(c.gitDir, 0755); err != nil {
@@ -125,11 +141,14 @@ func (c *Controller) ServeTSNet(w http.ResponseWriter, r *http.Request) {
 		c.serveArchive(w, r)
 	case "/stats":
 		c.serveStats(w, r)
+	case "/run":
+		c.serveRun(w, r)
 	case "/":
 		fmt.Fprintf(w, `<html><body><h1>Tailscale Build</h1><a href='/stats'>stats</a>
 		<form method=POST action=/fetch>Ref: <input name=ref><input type=submit value="fetch"></form>
 		<form method=POST action=/start-build>Ref: <input name=ref><input type=submit value="start"></form>
 		`)
+
 	}
 }
 
@@ -143,6 +162,42 @@ func (c *Controller) serveStats(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.Write(out)
+}
+
+func (c *Controller) registerRun(r *Run) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	mak.Set(&c.runs, r.id, r)
+}
+
+func (c *Controller) unregisterRun(r *Run) {
+	// TODO: demote to some other set that serveRun also looks up, but only keep
+	// the most recent N hours or M items in that other set?
+}
+
+func (c *Controller) serveRun(w http.ResponseWriter, r *http.Request) {
+	c.mu.Lock()
+	run, ok := c.runs[r.FormValue("id")]
+	c.mu.Unlock()
+	if !ok {
+		http.Error(w, "no such run, or long expired", http.StatusNotFound)
+		return
+	}
+
+	run.mu.Lock()
+	defer run.mu.Unlock()
+
+	fmt.Fprintf(w, "<html><body><h1>run %v</h1>", run.id)
+
+	if run.doneAt.IsZero() {
+		fmt.Fprintf(w, "<p>running for %v</p>", time.Since(run.createdAt))
+	} else {
+		var errMsg string
+		if run.err != nil {
+			errMsg = run.err.Error()
+		}
+		fmt.Fprintf(w, "<p>done in %v: %v</p>", run.doneAt.Sub(run.createdAt), html.EscapeString(errMsg))
+	}
 }
 
 func (c *Controller) serveJSON(w http.ResponseWriter, statusCode int, v any) {
@@ -273,11 +328,7 @@ func (c *Controller) serveStartBuild(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	fc := &fly.Client{
-		App:   *workerApp,
-		Token: os.Getenv("FLY_TOKEN"),
-	}
-	mm, err := fc.ListMachines(ctx)
+	mm, err := c.fc.ListMachines(ctx)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -296,63 +347,21 @@ func (c *Controller) serveStartBuild(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "no base config image machine", http.StatusInternalServerError)
 		return
 	}
+
+	run := &Run{
+		c:         c,
+		id:        rands.HexString(32),
+		fetch:     fetchRes,
+		base:      base,
+		createdAt: time.Now(),
+	}
+	run.ctx, run.cancel = context.WithTimeout(context.Background(), 30*time.Minute)
+	c.registerRun(run)
+	go run.Run()
+
+	http.Redirect(w, r, "/run?id="+run.id, http.StatusFound)
 	fmt.Fprintf(w, "<html><body>base machine: <pre>%v</pre>", logger.AsJSON(base))
-	w.(http.Flusher).Flush()
 
-	m, err := fc.CreateMachine(ctx, &fly.CreateMachineRequest{
-		Region: "sea",
-		Config: &fly.MachineConfig{
-			AutoDestroy: true,
-			Env: map[string]string{
-				"VM_MAX_DURATION": "5m",
-			},
-			Guest: &fly.MachineGuest{
-				MemoryMB: 8192, // required 2048 per core?
-				CPUs:     4,
-				CPUKind:  "performance",
-			},
-			Image: base.Config.Image,
-			Restart: &fly.MachineRestart{
-				Policy: "no",
-			},
-		},
-	})
-	if err != nil {
-		http.Error(w, "CreateMachine: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-	defer func() {
-		go func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			defer cancel()
-			err := fc.StopMachine(ctx, m.ID, &fly.StopParam{Signal: "kill", Timeout: time.Nanosecond})
-			log.Printf("stop machine = %v", err)
-			err = fc.DeleteMachine(ctx, m.ID)
-			log.Printf("delete machine = %v", err)
-		}()
-	}()
-
-	wc := &WorkerClient{m: m, c: c, hash: fetchRes.Hash}
-	if err := wc.WaitUp(15 * time.Second); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	io.WriteString(w, "made "+string(m.ID)+"\n")
-	w.(http.Flusher).Flush()
-
-	tgzURL := fmt.Sprintf("http://[%s]:8080/archive?hash=%s&ref=%s",
-		os.Getenv("FLY_PRIVATE_IP"), fetchRes.Hash, url.QueryEscape(fetchRes.LocalRef))
-
-	if err := wc.PushTreeFromURL(ctx, "", tgzURL); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	if err := wc.Test(ctx, w, "tailscale.com/util/lru"); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
 }
 
 type WorkerClient struct {
@@ -435,5 +444,83 @@ func (c *WorkerClient) Test(ctx context.Context, w io.Writer, pkg string) error 
 		return fmt.Errorf("pushing tarball: %v", res.Status)
 	}
 	io.Copy(w, res.Body)
+	return nil
+}
+
+type Run struct {
+	ctx    context.Context
+	cancel context.CancelFunc
+
+	c         *Controller
+	id        string // rand hex
+	fetch     *tbtype.FetchResponse
+	base      *fly.Machine
+	createdAt time.Time
+
+	mu     sync.Mutex
+	doneAt time.Time
+	err    error
+}
+
+func (r *Run) Run() {
+	err := r.run()
+	defer r.c.unregisterRun(r)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.doneAt = time.Now()
+	r.err = err
+}
+
+func (r *Run) run() error {
+	fc := r.c.fc
+	m, err := fc.CreateMachine(r.ctx, &fly.CreateMachineRequest{
+		Region: "sea",
+		Config: &fly.MachineConfig{
+			AutoDestroy: true,
+			Env: map[string]string{
+				"VM_MAX_DURATION": "5m",
+			},
+			Guest: &fly.MachineGuest{
+				MemoryMB: 8192, // required 2048 per core for performance
+				CPUs:     4,
+				CPUKind:  "performance",
+			},
+			Image: r.base.Config.Image,
+			Restart: &fly.MachineRestart{
+				Policy: "no",
+			},
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("CreateMachine: %w", err)
+	}
+	defer func() {
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			err := fc.StopMachine(ctx, m.ID, &fly.StopParam{Signal: "kill", Timeout: time.Nanosecond})
+			log.Printf("stop machine = %v", err)
+			err = fc.DeleteMachine(ctx, m.ID)
+			log.Printf("delete machine = %v", err)
+		}()
+	}()
+
+	wc := &WorkerClient{m: m, c: r.c, hash: r.fetch.Hash}
+	if err := wc.WaitUp(15 * time.Second); err != nil {
+		return fmt.Errorf("WorkerClient.WaitUp = %w", err)
+	}
+
+	tgzURL := fmt.Sprintf("http://[%s]:8080/archive?hash=%s&ref=%s",
+		os.Getenv("FLY_PRIVATE_IP"), r.fetch.Hash, url.QueryEscape(r.fetch.LocalRef))
+
+	if err := wc.PushTreeFromURL(r.ctx, "", tgzURL); err != nil {
+		return fmt.Errorf("PushTreeFromURL = %w", err)
+	}
+
+	var buf bytes.Buffer
+	if err := wc.Test(r.ctx, &buf, "tailscale.com/util/lru"); err != nil {
+		return fmt.Errorf("Test = %w", err)
+	}
+
 	return nil
 }
