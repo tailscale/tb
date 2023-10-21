@@ -39,7 +39,6 @@ import (
 	"tailscale.com/syncs"
 	"tailscale.com/tsnet"
 	"tailscale.com/tsweb"
-	"tailscale.com/types/logger"
 	"tailscale.com/util/cmpx"
 	"tailscale.com/util/mak"
 	"tailscale.com/util/rands"
@@ -244,6 +243,42 @@ func (c *Controller) unregisterRun(r *Run) {
 	// the most recent N hours or M items in that other set?
 }
 
+func (c *Controller) findFlyWorkerImage(ctx context.Context) (image string, err error) {
+	// TODO(bradfitz): cache. use last answer if in past minute or something.
+
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+
+	mm, err := c.fc.ListMachines(ctx)
+	if err != nil {
+		return "", err
+	}
+	var base *fly.Machine
+	var allBase = set.Set[*fly.Machine]{}
+	for _, m := range mm {
+		if strings.HasPrefix(m.Name, "base-") {
+			allBase.Add(m)
+			if base == nil || m.CreatedAt > base.CreatedAt {
+				base = m
+			}
+		}
+	}
+	if base == nil {
+		return "", errors.New("no base machine images found")
+	}
+	if base.Config == nil || base.Config.Image == "" {
+		return "", errors.New("base machine found has no config image")
+	}
+	// Clean up old base machines that aren't the latest.
+	for m := range allBase {
+		if m != base {
+			log.Printf("deleting old base machine %v", m.ID)
+			go c.bestEffortDeleteMachine(m.ID)
+		}
+	}
+	return base.Config.Image, nil
+}
+
 func (c *Controller) serveRun(w http.ResponseWriter, r *http.Request) {
 	c.mu.Lock()
 	run, ok := c.runs[r.FormValue("id")]
@@ -430,6 +465,16 @@ func (c *Controller) serveStartBuild(w http.ResponseWriter, r *http.Request) {
 		id:        rands.HexString(32),
 		createdAt: time.Now(),
 	}
+
+	var workerImageCallDone = make(chan error, 1)
+	go func() {
+		s := run.startSpan("find-fly-worker-image")
+		var err error
+		run.workerImage, err = c.findFlyWorkerImage(ctx)
+		s.end(err)
+		workerImageCallDone <- err
+	}()
+
 	s := run.startSpan("fetch-ref")
 	fetchRes, err := c.fetch(ref)
 	s.end(err)
@@ -440,47 +485,22 @@ func (c *Controller) serveStartBuild(w http.ResponseWriter, r *http.Request) {
 	run.fetch = fetchRes
 	// TODO(bradfitz): start building the tarball concurrently
 
-	s = run.startSpan("find-fly-worker-template")
-	mm, err := c.fc.ListMachines(ctx)
-	s.end(err)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	var base *fly.Machine
-	var allBase = set.Set[*fly.Machine]{}
-	for _, m := range mm {
-		if strings.HasPrefix(m.Name, "base-") {
-			allBase.Add(m)
-			if base == nil || m.CreatedAt > base.CreatedAt {
-				base = m
-			}
+	// Wait for the base image fetch to finish.
+	select {
+	case err := <-workerImageCallDone:
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
 		}
-	}
-	if base == nil {
-		http.Error(w, "no base machine", http.StatusInternalServerError)
+	case <-ctx.Done():
 		return
 	}
-	if base.Config == nil || base.Config.Image == "" {
-		http.Error(w, "no base config image machine", http.StatusInternalServerError)
-		return
-	}
-	// Clean up old base machines that aren't the latest.
-	for m := range allBase {
-		if m != base {
-			log.Printf("deleting old base machine %v", m.ID)
-			go c.bestEffortDeleteMachine(m.ID)
-		}
-	}
-	run.base = base
 
 	run.ctx, run.cancel = context.WithTimeout(context.Background(), 30*time.Minute)
 	c.registerRun(run)
 	go run.Run()
 
 	http.Redirect(w, r, "/run?id="+run.id, http.StatusFound)
-	fmt.Fprintf(w, "<html><body>base machine: <pre>%v</pre>", logger.AsJSON(base))
-
 }
 
 type WorkerClient struct {
@@ -610,11 +630,12 @@ type Run struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	c         *Controller
-	id        string // rand hex
-	fetch     *tbtype.FetchResponse
-	base      *fly.Machine
-	createdAt time.Time
+	c           *Controller
+	id          string // rand hex
+	fetch       *tbtype.FetchResponse
+	base        *fly.Machine
+	createdAt   time.Time
+	workerImage string
 
 	mu     sync.Mutex
 	doneAt time.Time
@@ -703,7 +724,7 @@ func (r *Run) run() error {
 				CPUs:     4,
 				CPUKind:  "performance",
 			},
-			Image: r.base.Config.Image,
+			Image: r.workerImage,
 			Restart: &fly.MachineRestart{
 				Policy: "no",
 			},
