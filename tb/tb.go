@@ -132,6 +132,8 @@ var (
 	metricWorkerWaitChanOK = expvar.NewInt("counter_worker_wait_chan_ok")
 	metricWorkerWaitPollOK = expvar.NewInt("counter_worker_wait_poll_ok")
 	metricCounterArchives  = expvar.NewInt("counter_archives")
+	metricDeleteMachineErr = expvar.NewInt("counter_delete_machine_err")
+	metricDeleteMachineOK  = expvar.NewInt("counter_delete_machine_ok")
 )
 
 // Serve6PN serves 6PN clients (over port 8080 on the Fly private IPv6 network
@@ -305,10 +307,21 @@ func (c *Controller) fetch(ref string) (*tbtype.FetchResponse, error) {
 }
 
 func (c *Controller) bestEffortDeleteMachine(id fly.MachineID) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	err := c.fc.DeleteMachine(ctx, id)
-	log.Printf("delete of machine %v: err=%v", id, err)
+
+	err := c.fc.StopMachine(ctx, id, &fly.StopParam{Signal: "kill", Timeout: time.Nanosecond})
+	log.Printf("stop machine = %v", err)
+
+	for ctx.Err() == nil {
+		err = c.fc.DeleteMachine(ctx, id)
+		log.Printf("delete of machine %v: err=%v", id, err)
+		if err == nil {
+			metricDeleteMachineOK.Add(1)
+			return
+		}
+		time.Sleep(time.Second)
+	}
 }
 
 func (c *Controller) serveFetch(w http.ResponseWriter, r *http.Request) {
@@ -700,16 +713,7 @@ func (r *Run) run() error {
 	if err != nil {
 		return fmt.Errorf("CreateMachine: %w", err)
 	}
-	defer func() {
-		go func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			defer cancel()
-			err := fc.StopMachine(ctx, m.ID, &fly.StopParam{Signal: "kill", Timeout: time.Nanosecond})
-			log.Printf("stop machine = %v", err)
-			err = fc.DeleteMachine(ctx, m.ID)
-			log.Printf("delete machine = %v", err)
-		}()
-	}()
+	defer func() { go r.c.bestEffortDeleteMachine(m.ID) }()
 
 	wc := &WorkerClient{m: m, c: r.c, hash: r.fetch.Hash, machineRand: machineRand}
 	s = r.startSpan("wait-up1")
