@@ -17,6 +17,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"expvar"
 	"flag"
 	"fmt"
 	"html"
@@ -36,10 +38,12 @@ import (
 	"github.com/tailscale/tb/tb/tbtype"
 	"tailscale.com/syncs"
 	"tailscale.com/tsnet"
+	"tailscale.com/tsweb"
 	"tailscale.com/types/logger"
 	"tailscale.com/util/cmpx"
 	"tailscale.com/util/mak"
 	"tailscale.com/util/rands"
+	"tailscale.com/util/set"
 )
 
 var (
@@ -53,13 +57,15 @@ type Controller struct {
 	cacheRoot string
 	gitDir    string // under cache
 
-	ts *tsnet.Server
-	fc *fly.Client
+	ts       *tsnet.Server
+	fc       *fly.Client
+	tsnetMux *http.ServeMux
 
 	machineSem syncs.Semaphore
 
-	mu   sync.Mutex
-	runs map[string]*Run
+	mu         sync.Mutex
+	runs       map[string]*Run
+	aliveChans map[string]chan bool
 }
 
 func main() {
@@ -72,11 +78,15 @@ func main() {
 		cacheRoot:  *cacheDir,
 		gitDir:     filepath.Join(*cacheDir, "git"),
 		machineSem: syncs.NewSemaphore(*maxMachines),
+		tsnetMux:   http.NewServeMux(),
 		fc: &fly.Client{
 			App:   *workerApp,
 			Token: os.Getenv("FLY_TOKEN"),
 		},
 	}
+	debugger := tsweb.Debugger(c.tsnetMux)
+	_ = debugger
+	c.tsnetMux.Handle("/", http.HandlerFunc(c.ServeTSNet))
 
 	if err := os.MkdirAll(c.gitDir, 0755); err != nil {
 		log.Fatal(err)
@@ -107,7 +117,7 @@ func main() {
 
 	errc := make(chan error)
 	go func() {
-		errc <- fmt.Errorf("tsnet.Serve: %w", http.Serve(ln, http.HandlerFunc(c.ServeTSNet)))
+		errc <- fmt.Errorf("tsnet.Serve: %w", http.Serve(ln, c.tsnetMux))
 	}()
 	go func() {
 		errc <- fmt.Errorf("http.Serve: %w", http.ListenAndServe(":8080", http.HandlerFunc(c.Serve6PN)))
@@ -116,14 +126,39 @@ func main() {
 	log.Fatal(<-errc)
 }
 
+var (
+	metricWorkAliveOK      = expvar.NewInt("counter_worker_alive_ok")
+	metricWorkAliveMiss    = expvar.NewInt("counter_worker_alive_miss")
+	metricWorkerWaitChanOK = expvar.NewInt("counter_worker_wait_chan_ok")
+	metricWorkerWaitPollOK = expvar.NewInt("counter_worker_wait_poll_ok")
+	metricCounterArchives  = expvar.NewInt("counter_archives")
+)
+
 // Serve6PN serves 6PN clients (over port 8080 on the Fly private IPv6 network
 // within the org, from the untrusted work app). These requests should be
 // assumed to be suspect.
 func (c *Controller) Serve6PN(w http.ResponseWriter, r *http.Request) {
-	if r.Method == "GET" && r.URL.Path == "/archive" {
-		c.serveArchive(w, r)
-		return
+	if r.Method == "GET" {
+		if r.URL.Path == "/archive" {
+			c.serveArchive(w, r)
+			return
+		}
+		if machineRand, ok := strings.CutPrefix(r.URL.Path, "/worker-alive/"); ok {
+			c := c.machineAliveChan(machineRand)
+			if c != nil {
+				select {
+				case c <- true:
+					metricWorkAliveOK.Add(1)
+					return
+				default:
+				}
+			}
+			metricWorkAliveMiss.Add(1)
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
 	}
+
 }
 
 // ServeTSNet serves tsnet clients (over Tailscale).
@@ -147,20 +182,21 @@ func (c *Controller) ServeTSNet(w http.ResponseWriter, r *http.Request) {
 		return
 	case "/archive":
 		c.serveArchive(w, r)
-	case "/stats":
-		c.serveStats(w, r)
+	case "/du":
+		c.serveDU(w, r)
 	case "/run":
 		c.serveRun(w, r)
 	case "/":
-		fmt.Fprintf(w, `<html><body><h1>Tailscale Build</h1><a href='/stats'>stats</a>
-		<form method=POST action=/fetch>Ref: <input name=ref><input type=submit value="fetch"></form>
-		<form method=POST action=/start-build>Ref: <input name=ref><input type=submit value="start"></form>
+		fmt.Fprintf(w, `<html><body><h1>Tailscale Build</h1>
+		[<a href='/du'>du</a>] [<a href="/debug">debug</a>]
+		<form method=POST action=/fetch>Fetch ref: <input name=ref><input type=submit value="fetch"></form>
+		<form method=POST action=/start-build>Test ref: <input name=ref><input type=submit value="start"></form>
 		`)
 
 	}
 }
 
-func (c *Controller) serveStats(w http.ResponseWriter, r *http.Request) {
+func (c *Controller) serveDU(w http.ResponseWriter, r *http.Request) {
 	cmd := exec.Command("du", "-h")
 	cmd.Dir = c.cacheRoot
 	out, err := cmd.CombinedOutput()
@@ -176,6 +212,29 @@ func (c *Controller) registerRun(r *Run) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	mak.Set(&c.runs, r.id, r)
+}
+
+func (c *Controller) runByLocalRef(ref string) *Run {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, r := range c.runs {
+		if r.fetch.LocalRef == ref {
+			return r
+		}
+	}
+	return nil
+}
+
+func (c *Controller) registerMachineAliveChan(id string, ch chan bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	mak.Set(&c.aliveChans, id, ch)
+}
+
+func (c *Controller) machineAliveChan(id string) chan bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.aliveChans[id]
 }
 
 func (c *Controller) unregisterRun(r *Run) {
@@ -245,6 +304,13 @@ func (c *Controller) fetch(ref string) (*tbtype.FetchResponse, error) {
 	}, nil
 }
 
+func (c *Controller) bestEffortDeleteMachine(id fly.MachineID) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	err := c.fc.DeleteMachine(ctx, id)
+	log.Printf("delete of machine %v: err=%v", id, err)
+}
+
 func (c *Controller) serveFetch(w http.ResponseWriter, r *http.Request) {
 	ref := r.FormValue("ref")
 	res, err := c.fetch(ref)
@@ -264,6 +330,7 @@ var (
 )
 
 func (c *Controller) serveArchive(w http.ResponseWriter, r *http.Request) {
+	metricCounterArchives.Add(1)
 	hash := r.FormValue("hash")
 	if !hashRx.MatchString(hash) {
 		http.Error(w, "bad 'hash'; want 40 lowercase hex", http.StatusBadRequest)
@@ -295,15 +362,23 @@ func (c *Controller) serveArchive(w http.ResponseWriter, r *http.Request) {
 	// sufficient, LRU of a dozen tarballs) and see if we've already made this
 	// tarball.
 
+	run := c.runByLocalRef(ref)
+	if run == nil {
+		log.Printf("can't find run for local ref %q", ref)
+		http.Error(w, "can't find run by local ref", http.StatusBadRequest)
+		return
+	}
+	s := run.startSpan("archive-clone-shallow")
+
 	td, err := os.MkdirTemp("", "tbarchive-*")
 	if err != nil {
+		s.end(err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	defer os.RemoveAll(td)
 
 	shallowClone := filepath.Join(td, "shallow")
-	// git clone --depth=1 --single-branch --branch=foo file:///Users/bradfitz/src/tailscale.com /tmp/git/lil2
 	cmd = exec.Command("git", "clone",
 		"--depth=1",
 		"--single-branch",
@@ -312,9 +387,13 @@ func (c *Controller) serveArchive(w http.ResponseWriter, r *http.Request) {
 		shallowClone)
 	cmd.Dir = c.gitDir
 	if out, err := cmd.CombinedOutput(); err != nil {
+		s.end(err)
 		http.Error(w, fmt.Sprintf("git clone: %v\n%s", err, out), http.StatusInternalServerError)
 		return
 	}
+	s.end(nil)
+
+	s = run.startSpan("archive-tar-send")
 
 	w.Header().Set("Content-Type", "application/gzip")
 	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s.tar.gz"`, hash))
@@ -323,7 +402,7 @@ func (c *Controller) serveArchive(w http.ResponseWriter, r *http.Request) {
 	cmd.Stdout = w
 	var errBuf bytes.Buffer
 	cmd.Stderr = &errBuf
-	if err := cmd.Run(); err != nil {
+	if err := s.end(cmd.Run()); err != nil {
 		http.Error(w, fmt.Sprintf("git archive: %v\n%s", err, errBuf.Bytes()), http.StatusInternalServerError)
 		return
 	}
@@ -332,21 +411,37 @@ func (c *Controller) serveArchive(w http.ResponseWriter, r *http.Request) {
 func (c *Controller) serveStartBuild(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	ref := r.FormValue("ref")
+
+	run := &Run{
+		c:         c,
+		id:        rands.HexString(32),
+		createdAt: time.Now(),
+	}
+	s := run.startSpan("fetch-ref")
 	fetchRes, err := c.fetch(ref)
+	s.end(err)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	run.fetch = fetchRes
+	// TODO(bradfitz): start building the tarball concurrently
 
+	s = run.startSpan("find-fly-worker-template")
 	mm, err := c.fc.ListMachines(ctx)
+	s.end(err)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	var base *fly.Machine
+	var allBase = set.Set[*fly.Machine]{}
 	for _, m := range mm {
-		if strings.HasPrefix(m.Name, "base-") && (base == nil || m.CreatedAt > base.CreatedAt) {
-			base = m
+		if strings.HasPrefix(m.Name, "base-") {
+			allBase.Add(m)
+			if base == nil || m.CreatedAt > base.CreatedAt {
+				base = m
+			}
 		}
 	}
 	if base == nil {
@@ -357,14 +452,15 @@ func (c *Controller) serveStartBuild(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "no base config image machine", http.StatusInternalServerError)
 		return
 	}
-
-	run := &Run{
-		c:         c,
-		id:        rands.HexString(32),
-		fetch:     fetchRes,
-		base:      base,
-		createdAt: time.Now(),
+	// Clean up old base machines that aren't the latest.
+	for m := range allBase {
+		if m != base {
+			log.Printf("deleting old base machine %v", m.ID)
+			go c.bestEffortDeleteMachine(m.ID)
+		}
 	}
+	run.base = base
+
 	run.ctx, run.cancel = context.WithTimeout(context.Background(), 30*time.Minute)
 	c.registerRun(run)
 	go run.Run()
@@ -375,28 +471,49 @@ func (c *Controller) serveStartBuild(w http.ResponseWriter, r *http.Request) {
 }
 
 type WorkerClient struct {
-	m    *fly.Machine
-	c    *Controller
-	hash string
+	m           *fly.Machine
+	c           *Controller
+	hash        string
+	machineRand string
 }
 
 func (c *WorkerClient) WaitUp(d time.Duration) error {
-	// TODO(bradfitz): this a little trashy. we could also use the
-	// https://docs.machines.dev/swagger/index.html#/Machines/Machines_wait call
-	// first before probing the /gen204.
-	deadline := time.Now().Add(d)
-	hc := &http.Client{Timeout: 2 * time.Second}
-	for time.Now().Before(deadline) {
-		res, _ := hc.Get("http://[" + c.m.PrivateIP.String() + "]:8080/gen204")
-		if res != nil && res.StatusCode == http.StatusNoContent {
-			return nil
+	donec := make(chan struct{})
+	defer close(donec)
+	alive := c.c.machineAliveChan(c.machineRand)
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+
+	upByPoll := make(chan struct{})
+	go func() {
+		hc := &http.Client{Timeout: 2 * time.Second}
+		for {
+			res, _ := hc.Get("http://[" + c.m.PrivateIP.String() + "]:8080/gen204")
+			if res != nil {
+				res.Body.Close()
+				if res.StatusCode == http.StatusNoContent {
+					close(upByPoll)
+					return
+				}
+			}
+			select {
+			case <-donec:
+				return
+			case <-time.After(time.Second):
+			}
 		}
-		if res != nil {
-			res.Body.Close()
-		}
-		time.Sleep(500 * time.Millisecond)
+	}()
+
+	select {
+	case <-alive:
+		metricWorkerWaitChanOK.Add(1)
+		return nil
+	case <-upByPoll:
+		metricWorkerWaitPollOK.Add(1)
+		return nil
+	case <-timer.C:
+		return errors.New("timeout waiting for machine to come up")
 	}
-	return fmt.Errorf("machine didn't come up in %v", d)
 }
 
 func (c *WorkerClient) PushTreeFromURL(ctx context.Context, dir, tgzURL string) error {
@@ -490,6 +607,7 @@ type Run struct {
 	doneAt time.Time
 	err    error
 	buf    bytes.Buffer
+	spans  []*span
 }
 
 func (r *Run) Run() {
@@ -507,14 +625,65 @@ func (r *Run) Write(p []byte) (n int, err error) {
 	return r.buf.Write(p)
 }
 
+type span struct {
+	name    string
+	r       *Run
+	startAt time.Time
+
+	// Mutable fields, guarded by r.mu:
+	endAt time.Time // or zero if still ru nning
+	err   error
+}
+
+func (r *Run) runSpan(name string, f func() error) error {
+	return r.startSpan(name).end(f())
+}
+
+func (r *Run) startSpan(name string) *span {
+	s := &span{
+		name:    name,
+		r:       r,
+		startAt: time.Now(),
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.spans = append(r.spans, s)
+	fmt.Fprintf(&r.buf, "[+%10s] span %q started\n", s.startAt.Sub(r.createdAt).Round(time.Millisecond).String(), name)
+	return s
+}
+
+func (s *span) end(err error) error {
+	r := s.r
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	s.endAt = time.Now()
+	s.err = err
+	res := "ok"
+	if err != nil {
+		res = err.Error()
+	}
+	fmt.Fprintf(&r.buf, "[+%10s] span %q ended after %v: %v\n",
+		s.endAt.Sub(r.createdAt).Round(time.Millisecond).String(),
+		s.name,
+		s.endAt.Sub(s.startAt).Round(time.Millisecond),
+		res)
+	return err
+}
+
 func (r *Run) run() error {
 	fc := r.c.fc
+
+	s := r.startSpan("create-machine1")
+	machineRand := rands.HexString(16)
+	aliveCh := make(chan bool, 1)
+	r.c.registerMachineAliveChan(machineRand, aliveCh)
 	m, err := fc.CreateMachine(r.ctx, &fly.CreateMachineRequest{
 		Region: "sea",
 		Config: &fly.MachineConfig{
 			AutoDestroy: true,
 			Env: map[string]string{
-				"VM_MAX_DURATION": "5m",
+				"VM_MAX_DURATION":    "5m",
+				"REGISTER_ALIVE_URL": "http://[" + os.Getenv("FLY_PRIVATE_IP") + "]:8080/worker-alive/" + machineRand,
 			},
 			Guest: &fly.MachineGuest{
 				MemoryMB: 8192, // required 2048 per core for performance
@@ -527,6 +696,7 @@ func (r *Run) run() error {
 			},
 		},
 	})
+	s.end(err)
 	if err != nil {
 		return fmt.Errorf("CreateMachine: %w", err)
 	}
@@ -541,29 +711,26 @@ func (r *Run) run() error {
 		}()
 	}()
 
-	wc := &WorkerClient{m: m, c: r.c, hash: r.fetch.Hash}
-	if err := wc.WaitUp(15 * time.Second); err != nil {
+	wc := &WorkerClient{m: m, c: r.c, hash: r.fetch.Hash, machineRand: machineRand}
+	s = r.startSpan("wait-up1")
+	if err := s.end(wc.WaitUp(15 * time.Second)); err != nil {
 		return fmt.Errorf("WorkerClient.WaitUp = %w", err)
 	}
 
-	t0 := time.Now()
-	fmt.Fprintf(r, "Pushing tree...\n")
 	tgzURL := fmt.Sprintf("http://[%s]:8080/archive?hash=%s&ref=%s",
 		os.Getenv("FLY_PRIVATE_IP"), r.fetch.Hash, url.QueryEscape(r.fetch.LocalRef))
 
-	if err := wc.PushTreeFromURL(r.ctx, "", tgzURL); err != nil {
+	if err := r.runSpan("push-work-tree", func() error { return wc.PushTreeFromURL(r.ctx, "", tgzURL) }); err != nil {
 		return fmt.Errorf("PushTreeFromURL = %w", err)
 	}
-	fmt.Fprintf(r, "Pushed tree in %v\n", time.Since(t0))
 
-	t0 = time.Now()
+	s = r.startSpan("check-go")
 	v, err := wc.CheckGo(r.ctx)
-	fmt.Fprintf(r, "CheckGo = %q, %v in %v\n", v, err, time.Since(t0))
+	s.end(err)
+	fmt.Fprintf(r, "CheckGo = %q, %v\n", v, err)
 
 	for _, pkg := range []string{"tailscale.com/util/lru", "tailscale.com/util/cmpx"} {
-		t0 := time.Now()
-		err := wc.Test(r.ctx, r, pkg)
-		fmt.Fprintf(r, "test %v = %v, in %v\n", pkg, err, time.Since(t0))
+		r.runSpan("test-"+pkg, func() error { return wc.Test(r.ctx, r, pkg) })
 	}
 
 	return nil

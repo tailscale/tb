@@ -11,4 +11,4 @@ push-tb:
 # 	@flyctl machine list -a tb-no-secrets --json  | jq -r '.[] | select(.name == "base") | .id' | xargs fly machine -a tb-no-secrets destroy -f 
 
 push-tbw: # nuke-tbw-base
-	@flyctl machine run -c tbw/fly.toml --name=base-$$(date +%s) --autostart=false --restart=no --env=EXIT_ON_START=1 .
+	@flyctl machine run -c tbw/fly.toml --name=base-$$(date +%s) --autostart=false --restart=no --env=EXIT_ON_START=1 --region=sea .

@@ -48,6 +48,18 @@ func main() {
 	}
 	fmt.Println("tbw running.")
 
+	if v := os.Getenv("REGISTER_ALIVE_URL"); v != "" {
+		go func() {
+			res, err := http.Get(v)
+			if err != nil {
+				log.Printf("Alive URL %v error: %v", v, err)
+				return
+			}
+			defer res.Body.Close()
+			log.Printf("Alive URL %v says: %v", v, res.Status)
+		}()
+	}
+
 	if err := os.MkdirAll(workDir, 0755); err != nil {
 		log.Fatal(err)
 	}
