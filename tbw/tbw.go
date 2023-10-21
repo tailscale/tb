@@ -46,7 +46,7 @@ func main() {
 		fmt.Println("tb shutting down on start per EXIT_ON_START")
 		return
 	}
-	fmt.Println("tb running.")
+	fmt.Println("tbw running.")
 
 	if err := os.MkdirAll(workDir, 0755); err != nil {
 		log.Fatal(err)
@@ -69,6 +69,7 @@ func main() {
 		os.Exit(0)
 	}))
 	m.HandleFunc("/test/", test)
+	m.HandleFunc("/check/go-version", toolGoVersion)
 	m.HandleFunc("/env", env)
 	log.Fatal(http.ListenAndServe(":8080", m))
 }
@@ -78,24 +79,38 @@ func shutdownOfLastResort() {
 }
 
 func handle(w http.ResponseWriter, r *http.Request) {
-	io.WriteString(w, "hi from fly machines\n")
+	io.WriteString(w, "hi from fly machines.\n")
 }
 
 func test(w http.ResponseWriter, r *http.Request) {
 	pkg := strings.TrimPrefix(r.RequestURI, "/test/")
 	log.Printf("testing %v ...", pkg)
 	t0 := time.Now()
-	cmd := exec.Command(filepath.Join(workDir, "tool/go"), "test", "-json", "-v", pkg)
+	cmd := exec.Command(filepath.Join(workDir, "tool/go"), "test", "-json", "-v")
+	cmd.Args = append(cmd.Args, pkg)
 	cmd.Dir = workDir
 	cmd.Stdout = w
 	cmd.Stderr = w
-	cmd.Env = os.Environ()
+	cmd.Env = append(os.Environ(),
+		"HOME="+workDir,
+	)
 	for _, v := range r.Header["Test-Env"] {
 		cmd.Env = append(cmd.Env, v)
 	}
 	err := cmd.Run()
 	d := time.Since(t0).Round(time.Millisecond)
 	log.Printf("test of %v = %v in %v", pkg, err, d)
+}
+
+func toolGoVersion(w http.ResponseWriter, r *http.Request) {
+	cmd := exec.Command(filepath.Join(workDir, "tool/go"), "version")
+	cmd.Dir = workDir
+	cmd.Stdout = w
+	cmd.Stderr = w
+	cmd.Env = append(os.Environ(),
+		"HOME="+workDir,
+	)
+	cmd.Run()
 }
 
 func env(w http.ResponseWriter, r *http.Request) {
@@ -157,13 +172,11 @@ func handlePutTarball(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	t1 := time.Now()
 	err := untar(tgz, baseDir)
 	if err != nil {
 		http.Error(w, err.Error(), httpStatus(err))
 		return
 	}
-	log.Printf("writetgz: wrote tar post-headers in %v", time.Since(t1))
 	io.WriteString(w, "OK")
 }
 

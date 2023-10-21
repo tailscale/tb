@@ -5,6 +5,14 @@
 // (that does not have access to secrets) where builds are run.
 package main
 
+/*
+
+TODO:
+- set CI:true env var
+- record time traces (in Go format? can we exclude built-in trace info?)
+
+*/
+
 import (
 	"bytes"
 	"context"
@@ -198,6 +206,8 @@ func (c *Controller) serveRun(w http.ResponseWriter, r *http.Request) {
 		}
 		fmt.Fprintf(w, "<p>done in %v: %v</p>", run.doneAt.Sub(run.createdAt), html.EscapeString(errMsg))
 	}
+
+	fmt.Fprintf(w, "<hr><pre>\n%s\n</pre>", html.EscapeString(run.buf.String()))
 }
 
 func (c *Controller) serveJSON(w http.ResponseWriter, statusCode int, v any) {
@@ -411,6 +421,25 @@ func (c *WorkerClient) PushTreeFromURL(ctx context.Context, dir, tgzURL string) 
 	return nil
 }
 
+func (c *WorkerClient) CheckGo(ctx context.Context) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Minute)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, "GET", "http://["+c.m.PrivateIP.String()+"]:8080/check/go-version", nil)
+	if err != nil {
+		return "", err
+	}
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer res.Body.Close()
+	if res.StatusCode != 200 {
+		return "", fmt.Errorf("pushing tarball: %v", res.Status)
+	}
+	all, err := io.ReadAll(res.Body)
+	return strings.TrimSpace(string(all)), err
+}
+
 func (c *WorkerClient) Test(ctx context.Context, w io.Writer, pkg string) error {
 	ctx, cancel := context.WithTimeout(ctx, 15*time.Minute)
 	defer cancel()
@@ -460,6 +489,7 @@ type Run struct {
 	mu     sync.Mutex
 	doneAt time.Time
 	err    error
+	buf    bytes.Buffer
 }
 
 func (r *Run) Run() {
@@ -469,6 +499,12 @@ func (r *Run) Run() {
 	defer r.mu.Unlock()
 	r.doneAt = time.Now()
 	r.err = err
+}
+
+func (r *Run) Write(p []byte) (n int, err error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.buf.Write(p)
 }
 
 func (r *Run) run() error {
@@ -510,16 +546,24 @@ func (r *Run) run() error {
 		return fmt.Errorf("WorkerClient.WaitUp = %w", err)
 	}
 
+	t0 := time.Now()
+	fmt.Fprintf(r, "Pushing tree...\n")
 	tgzURL := fmt.Sprintf("http://[%s]:8080/archive?hash=%s&ref=%s",
 		os.Getenv("FLY_PRIVATE_IP"), r.fetch.Hash, url.QueryEscape(r.fetch.LocalRef))
 
 	if err := wc.PushTreeFromURL(r.ctx, "", tgzURL); err != nil {
 		return fmt.Errorf("PushTreeFromURL = %w", err)
 	}
+	fmt.Fprintf(r, "Pushed tree in %v\n", time.Since(t0))
 
-	var buf bytes.Buffer
-	if err := wc.Test(r.ctx, &buf, "tailscale.com/util/lru"); err != nil {
-		return fmt.Errorf("Test = %w", err)
+	t0 = time.Now()
+	v, err := wc.CheckGo(r.ctx)
+	fmt.Fprintf(r, "CheckGo = %q, %v in %v\n", v, err, time.Since(t0))
+
+	for _, pkg := range []string{"tailscale.com/util/lru", "tailscale.com/util/cmpx"} {
+		t0 := time.Now()
+		err := wc.Test(r.ctx, r, pkg)
+		fmt.Fprintf(r, "test %v = %v, in %v\n", pkg, err, time.Since(t0))
 	}
 
 	return nil
