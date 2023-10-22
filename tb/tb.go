@@ -34,6 +34,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -197,7 +198,7 @@ func (c *Controller) ServeTSNet(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, `<html><body><h1>Tailscale Build</h1>
 		[<a href='/du'>du</a>] [<a href="/debug">debug</a>]
 		<form method=POST action=/fetch>Fetch ref: <input name=ref><input type=submit value="fetch"></form>
-		<form method=POST action=/start-build>Test ref: <input name=ref><input type=submit value="start"></form>
+		<form method=POST action=/start-build>Test ref: <input name=ref> package(s)/all: <input name=pkg> <input type=submit value="start"></form>
 		`)
 
 	}
@@ -465,11 +466,29 @@ func (c *Controller) serveArchive(w http.ResponseWriter, r *http.Request) {
 func (c *Controller) serveStartBuild(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	ref := r.FormValue("ref")
+	var pkgs []string
+	pkg := r.FormValue("pkg")
+	switch pkg {
+	case "":
+		pkgs = []string{"tailscale.com/util/lru", "tailscale.com/util/cmpx"}
+	case "all":
+		for _, v := range strings.Fields(somePackages) {
+			pkgs = append(pkgs, path.Join("tailscale.com", v))
+		}
+	default:
+		pkgs = strings.Fields(pkg)
+		for i, v := range pkgs {
+			if !strings.Contains(v, ".") {
+				pkgs[i] = "tailscale.com/" + v
+			}
+		}
+	}
 
 	run := &Run{
 		c:         c,
 		id:        rands.HexString(32),
 		createdAt: time.Now(),
+		pkgs:      pkgs,
 	}
 
 	var workerImageCallDone = make(chan error, 1)
@@ -643,6 +662,8 @@ type Run struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
+	pkgs []string // TODO: flesh this out into a real task type
+
 	c           *Controller
 	id          string // rand hex
 	fetch       *tbtype.FetchResponse
@@ -746,7 +767,7 @@ func (r *Run) run() error {
 		Config: &fly.MachineConfig{
 			AutoDestroy: true,
 			Env: map[string]string{
-				"VM_MAX_DURATION":    "5m",
+				"VM_MAX_DURATION":    "20m",
 				"REGISTER_ALIVE_URL": "http://[" + os.Getenv("FLY_PRIVATE_IP") + "]:8080/worker-alive/" + machineRand,
 			},
 			Guest: &fly.MachineGuest{
@@ -789,7 +810,7 @@ func (r *Run) run() error {
 	s.end(err)
 	fmt.Fprintf(r, "CheckGo = %q, %v\n", v, err)
 
-	for _, pkg := range []string{"tailscale.com/util/lru", "tailscale.com/util/cmpx"} {
+	for _, pkg := range r.pkgs {
 		r.runSpan("test-"+pkg, func() error { return wc.Test(r.ctx, r, pkg) })
 	}
 
@@ -849,3 +870,175 @@ func (c *Controller) getToolchainTarball(ctx context.Context, goHash string) (tg
 	metricToolChainFilled.Add(1)
 	return all, nil
 }
+
+// somePackages is a temporary (2023-10-21) list of packages in the tailscale.com
+// module for development. It will be removed when we query this dynamically.
+var somePackages = `
+.
+appc
+atomicfile
+chirp
+client/tailscale
+client/web
+clientupdate
+clientupdate/distsign
+cmd/cloner
+cmd/containerboot
+cmd/derper
+cmd/gitops-pusher
+cmd/k8s-operator
+cmd/sniproxy
+cmd/tailscale
+cmd/tailscale/cli
+cmd/tailscaled
+cmd/testwrapper
+cmd/testwrapper/flakytest
+control/controlbase
+control/controlclient
+control/controlhttp
+control/controlknobs
+derp
+derp/derphttp
+disco
+doctor
+doctor/permissions
+envknob/logknob
+health
+hostinfo
+ipn
+ipn/ipnlocal
+ipn/ipnserver
+ipn/localapi
+ipn/store
+ipn/store/awsstore
+jsondb
+log/filelogger
+log/sockstatlog
+logpolicy
+logtail
+logtail/filch
+metrics
+net/art
+net/connstats
+net/dns
+net/dns/publicdns
+net/dns/recursive
+net/dns/resolvconffile
+net/dns/resolver
+net/dnscache
+net/dnsfallback
+net/flowtrack
+net/interfaces
+net/memnet
+net/netcheck
+net/neterror
+net/netmon
+net/netns
+net/netstat
+net/netutil
+net/packet
+net/packet/checksum
+net/ping
+net/portmapper
+net/proxymux
+net/routetable
+net/socks5
+net/sockstats
+net/speedtest
+net/stun
+net/tcpinfo
+net/tlsdial
+net/tsaddr
+net/tsdial
+net/tshttpproxy
+net/tstun
+packages/deb
+portlist
+posture
+prober
+safesocket
+ssh/tailssh
+syncs
+tailcfg
+taildrop
+tempfork/device
+tempfork/gliderlabs/ssh
+tempfork/heap
+tempfork/pprof
+tka
+tool/gocross
+tsnet
+tstest
+tstest/archtest
+tstest/deptest
+tstest/integration
+tstest/integration/vms
+tstest/iosdeps
+tstest/jsdeps
+tstest/natlab
+tstime
+tstime/mono
+tstime/rate
+tsweb
+tsweb/promvarz
+tsweb/varz
+types/appctype
+types/dnstype
+types/ipproto
+types/key
+types/lazy
+types/logger
+types/logid
+types/netlogtype
+types/netmap
+types/opt
+types/persist
+types/tkatype
+types/views
+util/clientmetric
+util/cmpver
+util/cmpx
+util/cstruct
+util/deephash
+util/dirwalk
+util/dnsname
+util/goroutines
+util/hashx
+util/httphdr
+util/httpm
+util/jsonutil
+util/limiter
+util/linuxfw
+util/linuxfw/linuxfwtest
+util/lru
+util/mak
+util/multierr
+util/nocasemaps
+util/osdiag
+util/pidowner
+util/race
+util/rands
+util/ringbuffer
+util/set
+util/singleflight
+util/slicesx
+util/syspolicy
+util/sysresources
+util/testenv
+util/truncate
+util/uniq
+util/vizerror
+util/winutil
+util/winutil/policy
+version
+version/mkversion
+wgengine
+wgengine/filter
+wgengine/magicsock
+wgengine/netstack
+wgengine/router
+wgengine/wgcfg
+wgengine/wgint
+wgengine/wglog
+words
+`
