@@ -30,6 +30,7 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -100,15 +101,38 @@ func handle(w http.ResponseWriter, r *http.Request) {
 	io.WriteString(w, "hi from fly machines.\n")
 }
 
+type webWriter struct {
+	typ int // 1=stdout, 2=stderr, -1, exit status
+	mu  *sync.Mutex
+	je  *json.Encoder
+	f   http.Flusher
+}
+
+func (w webWriter) Write(p []byte) (n int, err error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	err = w.je.Encode([]any{w.typ, string(p)})
+	if err != nil {
+		return 0, err
+	}
+	w.f.Flush()
+	return len(p), nil
+}
+
 func test(w http.ResponseWriter, r *http.Request) {
 	pkg := strings.TrimPrefix(r.RequestURI, "/test/")
 	log.Printf("testing %v ...", pkg)
 	t0 := time.Now()
 	cmd := exec.Command(filepath.Join(codeDir, "tool/go"), "test", "-json", "-v")
+
+	var mu sync.Mutex
+	je := json.NewEncoder(w)
+	f := w.(http.Flusher)
+
 	cmd.Args = append(cmd.Args, pkg)
 	cmd.Dir = codeDir
-	cmd.Stdout = w
-	cmd.Stderr = w
+	cmd.Stdout = &webWriter{1, &mu, je, f}
+	cmd.Stderr = &webWriter{2, &mu, je, f}
 	cmd.Env = append(os.Environ(),
 		"HOME="+workDir,
 	)
