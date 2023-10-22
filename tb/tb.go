@@ -11,6 +11,12 @@ TODO:
 - set CI:true env var
 - record time traces (in Go format? can we exclude built-in trace info?)
 
+% git grep -l -e '^func Test' $(git rev-parse HEAD)
+bb93ec5d320917178637529a97f9a27610ca6446:appc/appc_test.go
+bb93ec5d320917178637529a97f9a27610ca6446:appc/handlers_test.go
+bb93ec5d320917178637529a97f9a27610ca6446:atomicfile/atomicfile_test.go
+...
+
 */
 
 import (
@@ -483,6 +489,7 @@ func (c *Controller) serveStartBuild(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	run.fetch = fetchRes
+
 	// TODO(bradfitz): start building the tarball concurrently
 
 	// Wait for the base image fetch to finish.
@@ -552,10 +559,11 @@ func (c *WorkerClient) WaitUp(d time.Duration) error {
 func (c *WorkerClient) PushTreeFromURL(ctx context.Context, dir, tgzURL string) error {
 	ctx, cancel := context.WithTimeout(ctx, time.Minute)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, "POST", "http://["+c.m.PrivateIP.String()+"]:8080/put", strings.NewReader((url.Values{
-		"url": {tgzURL},
-		"dir": {dir},
-	}).Encode()))
+	req, err := http.NewRequestWithContext(ctx, "POST",
+		"http://["+c.m.PrivateIP.String()+"]:8080/put?dir="+url.QueryEscape(dir),
+		strings.NewReader((url.Values{
+			"url": {tgzURL},
+		}).Encode()))
 	if err != nil {
 		return err
 	}
@@ -569,6 +577,27 @@ func (c *WorkerClient) PushTreeFromURL(ctx context.Context, dir, tgzURL string) 
 		return fmt.Errorf("pushing tarball: %v", res.Status)
 	}
 	return nil
+}
+
+func (c *WorkerClient) PushTreeFromReader(ctx context.Context, dir string, r io.Reader) error {
+	ctx, cancel := context.WithTimeout(ctx, time.Minute)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, "PUT",
+		"http://["+c.m.PrivateIP.String()+"]:8080/put?dir="+url.QueryEscape(dir),
+		r)
+	if err != nil {
+		return err
+	}
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer res.Body.Close()
+	if res.StatusCode != 200 {
+		return fmt.Errorf("pushing tarball: %v", res.Status)
+	}
+	return nil
+
 }
 
 func (c *WorkerClient) CheckGo(ctx context.Context) (string, error) {
@@ -598,29 +627,13 @@ func (c *WorkerClient) Test(ctx context.Context, w io.Writer, pkg string) error 
 		return err
 	}
 
-	cmd := exec.Command("git", "show", c.hash+":go.toolchain.rev")
-	cmd.Dir = c.c.gitDir
-	toolChain, err := cmd.Output()
-	if err != nil {
-		return fmt.Errorf("looking up go.toolchain.rev for %v: %v", c.hash, err)
-	}
-
-	// TODO(bradfitz): remove these. This was a dead end experiment
-	// for a throway branch. What we really need to do is send over
-	// a tarball of a .git directory shallow clone checked out.
-	// e.g. git clone file:///Users/bradfitz/src/tailscale.com --depth=1 foo
-	// in foo along with its .foo/git. That ~doubles the size of the tarball
-	// but that's kinda tolerable for now.
-	req.Header.Add("Test-Env", "GOCROSS_WANTVER="+c.hash)
-	req.Header.Add("Test-Env", "GO_TOOLCHAIN_REV="+strings.TrimSpace(string(toolChain)))
-
 	res, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return err
 	}
 	defer res.Body.Close()
 	if res.StatusCode != 200 {
-		return fmt.Errorf("pushing tarball: %v", res.Status)
+		return fmt.Errorf("testing %v: %v", pkg, res.Status)
 	}
 	io.Copy(w, res.Body)
 	return nil
@@ -646,6 +659,7 @@ type Run struct {
 
 func (r *Run) Run() {
 	err := r.run()
+	log.Printf("Run error: %v", err)
 	defer r.c.unregisterRun(r)
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -707,7 +721,23 @@ func (s *span) end(err error) error {
 func (r *Run) run() error {
 	fc := r.c.fc
 
-	s := r.startSpan("create-machine1")
+	cmd := exec.Command("git", "show", r.fetch.Hash+":go.toolchain.rev")
+	cmd.Dir = r.c.gitDir
+	toolChainOut, err := cmd.Output()
+	if err != nil {
+		return fmt.Errorf("looking up go.toolchain.rev for %v: %v", r.fetch.Hash, err)
+	}
+	toolchain := strings.TrimSpace(string(toolChainOut))
+
+	s := r.startSpan("get-toolchain-tgz")
+	// TODO(bradfitz): fetch this tarball async. add some lazy concurrent type with a context.
+	toolChainTarball, err := r.c.getToolchainTarball(r.ctx, toolchain)
+	s.end(err)
+	if err != nil {
+		return fmt.Errorf("getting toolchain: %v", err)
+	}
+
+	s = r.startSpan("create-machine1")
 	machineRand := rands.HexString(16)
 	aliveCh := make(chan bool, 1)
 	r.c.registerMachineAliveChan(machineRand, aliveCh)
@@ -745,8 +775,13 @@ func (r *Run) run() error {
 	tgzURL := fmt.Sprintf("http://[%s]:8080/archive?hash=%s&ref=%s",
 		os.Getenv("FLY_PRIVATE_IP"), r.fetch.Hash, url.QueryEscape(r.fetch.LocalRef))
 
-	if err := r.runSpan("push-work-tree", func() error { return wc.PushTreeFromURL(r.ctx, "", tgzURL) }); err != nil {
+	if err := r.runSpan("push-work-tree", func() error { return wc.PushTreeFromURL(r.ctx, "code", tgzURL) }); err != nil {
 		return fmt.Errorf("PushTreeFromURL = %w", err)
+	}
+	if err := r.runSpan("push-go-toolchain", func() error {
+		return wc.PushTreeFromReader(r.ctx, "tailscale-go/"+toolchain, bytes.NewReader(toolChainTarball))
+	}); err != nil {
+		return fmt.Errorf("PushTreeFromReader = %w", err)
 	}
 
 	s = r.startSpan("check-go")
@@ -759,4 +794,58 @@ func (r *Run) run() error {
 	}
 
 	return nil
+}
+
+var (
+	metricToolChainHit    = expvar.NewInt("counter_toolchain_hit")
+	metricToolChainMiss   = expvar.NewInt("counter_toolchain_miss")
+	metricToolChainFilled = expvar.NewInt("counter_toolchain_filled")
+	metricToolChainErr    = expvar.NewInt("counter_toolchain_err")
+)
+
+func (c *Controller) getToolchainTarball(ctx context.Context, goHash string) (tgz []byte, retErr error) {
+	defer func() {
+		if retErr != nil {
+			metricToolChainErr.Add(1)
+		}
+	}()
+	if !hashRx.MatchString(goHash) {
+		return nil, fmt.Errorf("bad hash")
+	}
+
+	cacheDir := filepath.Join(c.cacheRoot, "toolchain")
+	if err := os.MkdirAll(cacheDir, 0755); err != nil {
+		return nil, err
+	}
+	cacheFile := filepath.Join(cacheDir, goHash+".tar.gz")
+	if all, err := os.ReadFile(cacheFile); err == nil {
+		metricToolChainHit.Add(1)
+		return all, nil
+	}
+	metricToolChainMiss.Add(1)
+	req, err := http.NewRequestWithContext(ctx, "GET", "https://github.com/tailscale/go/releases/download/build-"+goHash+"/linux-amd64.tar.gz", nil)
+	if err != nil {
+		return nil, err
+	}
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer res.Body.Close()
+	if res.StatusCode != 200 {
+		return nil, fmt.Errorf("bad status: %v", res.Status)
+	}
+	all, err := io.ReadAll(res.Body)
+	if err != nil {
+		return nil, err
+	}
+	tmpFile := cacheFile + ".tmp"
+	if err := os.WriteFile(tmpFile, all, 0644); err != nil {
+		return nil, err
+	}
+	if err := os.Rename(tmpFile, cacheFile); err != nil {
+		return nil, err
+	}
+	metricToolChainFilled.Add(1)
+	return all, nil
 }

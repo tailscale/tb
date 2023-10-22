@@ -33,7 +33,10 @@ import (
 	"time"
 )
 
-const workDir = "/home/workdir"
+const (
+	workDir = "/home/workdir"      // and HOME
+	codeDir = "/home/workdir/code" // where the repo gets pushed
+)
 
 func main() {
 	dur, _ := time.ParseDuration(os.Getenv("VM_MAX_DURATION"))
@@ -61,6 +64,9 @@ func main() {
 	}
 
 	if err := os.MkdirAll(workDir, 0755); err != nil {
+		log.Fatal(err)
+	}
+	if err := os.MkdirAll(codeDir, 0755); err != nil {
 		log.Fatal(err)
 	}
 
@@ -98,9 +104,9 @@ func test(w http.ResponseWriter, r *http.Request) {
 	pkg := strings.TrimPrefix(r.RequestURI, "/test/")
 	log.Printf("testing %v ...", pkg)
 	t0 := time.Now()
-	cmd := exec.Command(filepath.Join(workDir, "tool/go"), "test", "-json", "-v")
+	cmd := exec.Command(filepath.Join(codeDir, "tool/go"), "test", "-json", "-v")
 	cmd.Args = append(cmd.Args, pkg)
-	cmd.Dir = workDir
+	cmd.Dir = codeDir
 	cmd.Stdout = w
 	cmd.Stderr = w
 	cmd.Env = append(os.Environ(),
@@ -115,8 +121,8 @@ func test(w http.ResponseWriter, r *http.Request) {
 }
 
 func toolGoVersion(w http.ResponseWriter, r *http.Request) {
-	cmd := exec.Command(filepath.Join(workDir, "tool/go"), "version")
-	cmd.Dir = workDir
+	cmd := exec.Command(filepath.Join(codeDir, "tool/go"), "version")
+	cmd.Dir = codeDir
 	cmd.Stdout = w
 	cmd.Stderr = w
 	cmd.Env = append(os.Environ(),
@@ -189,6 +195,23 @@ func handlePutTarball(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), httpStatus(err))
 		return
 	}
+
+	if hash, ok := strings.CutPrefix(urlParam.Get("dir"), "tailscale-go/"); ok {
+		os.MkdirAll(filepath.Join(workDir, ".cache"), 0755)
+		if err := os.Rename(
+			filepath.Join(workDir, "tailscale-go", hash, "go"),
+			filepath.Join(workDir, ".cache", "tailscale-go")); err != nil {
+			http.Error(w, err.Error(), httpStatus(err))
+			return
+		}
+		if err := os.WriteFile(
+			filepath.Join(workDir, ".cache", "tailscale-go.extracted"),
+			[]byte(hash+"\n"), 0644); err != nil {
+			http.Error(w, err.Error(), httpStatus(err))
+			return
+		}
+	}
+
 	io.WriteString(w, "OK")
 }
 

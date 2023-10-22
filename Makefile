@@ -5,7 +5,7 @@ usage:
 	@echo "  push-tbw - push worker to fly.io"
 
 push-tb:
-	@flyctl deploy -c tb/fly.toml .
+	@flyctl deploy -c tb/fly.toml --vm-size=performance-2x .
 
 # nuke-tbw-base:
 # 	@flyctl machine list -a tb-no-secrets --json  | jq -r '.[] | select(.name == "base") | .id' | xargs fly machine -a tb-no-secrets destroy -f 
