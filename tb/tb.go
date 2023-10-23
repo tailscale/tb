@@ -41,6 +41,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/bradfitz/go-tool-cache/cachers"
 	"github.com/tailscale/tb/fly"
 	"github.com/tailscale/tb/tb/tbtype"
 	"tailscale.com/syncs"
@@ -78,6 +79,14 @@ func main() {
 	flag.Parse()
 	if strings.HasPrefix(*stateDir, *cacheDir) {
 		log.Fatalf("state and cache directories must be different")
+	}
+
+	goCacheDir := filepath.Join(*cacheDir, "gocache")
+	if err := os.MkdirAll(goCacheDir, 0755); err != nil {
+		log.Fatal(err)
+	}
+	goCache := &goCacheServer{
+		cache: &cachers.DiskCache{Dir: goCacheDir},
 	}
 
 	c := &Controller{
@@ -127,6 +136,9 @@ func main() {
 	}()
 	go func() {
 		errc <- fmt.Errorf("http.Serve: %w", http.ListenAndServe(":8080", http.HandlerFunc(c.Serve6PN)))
+	}()
+	go func() {
+		errc <- fmt.Errorf("http.Serve(gocache 8081): %w", http.ListenAndServe(":8081", goCache))
 	}()
 
 	log.Fatal(<-errc)
@@ -463,6 +475,7 @@ func (c *Controller) serveStartBuild(w http.ResponseWriter, r *http.Request) {
 	ref := r.FormValue("ref")
 	var pkgs []string
 	pkg := r.FormValue("pkg")
+	goCache := r.FormValue("gocache") // "rw", "ro", or "" for none
 	switch pkg {
 	case "":
 		pkgs = []string{"tailscale.com/util/lru", "tailscale.com/util/cmpx"}
@@ -478,12 +491,16 @@ func (c *Controller) serveStartBuild(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	if ref == "main" {
+		goCache = "rw"
+	}
 
 	run := &Run{
 		c:         c,
 		id:        rands.HexString(32),
 		createdAt: time.Now(),
 		pkgs:      pkgs,
+		goCache:   goCache,
 	}
 
 	var workerImageCallDone = make(chan error, 1)
@@ -614,10 +631,22 @@ func (c *WorkerClient) PushTreeFromReader(ctx context.Context, dir string, r io.
 
 }
 
+func cacheServerAddr() string {
+	return "http://" + os.Getenv("FLY_REGION") + "." + os.Getenv("FLY_APP_NAME") + ".internal:8081"
+}
+
+type ExecOpt struct {
+	GoCache string // "rw", "ro", or ""
+}
+
+var zeroOpt = new(ExecOpt)
+
 func (c *WorkerClient) CheckGo(ctx context.Context) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, 15*time.Minute)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, "GET", "http://["+c.m.PrivateIP.String()+"]:8080/check/go-version", nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", "http://["+c.m.PrivateIP.String()+"]:8080/check/go-version?"+(url.Values{
+		"cache-server": {cacheServerAddr()},
+	}).Encode(), nil)
 	if err != nil {
 		return "", err
 	}
@@ -636,7 +665,10 @@ func (c *WorkerClient) CheckGo(ctx context.Context) (string, error) {
 func (c *WorkerClient) Test(ctx context.Context, w io.Writer, pkg string) error {
 	ctx, cancel := context.WithTimeout(ctx, 15*time.Minute)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, "GET", "http://["+c.m.PrivateIP.String()+"]:8080/test/"+pkg, nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", "http://["+c.m.PrivateIP.String()+"]:8080/test?"+(url.Values{
+		"pkg":          {pkg},
+		"cache-server": {cacheServerAddr()},
+	}).Encode(), nil)
 	if err != nil {
 		return err
 	}
@@ -657,7 +689,8 @@ type Run struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	pkgs []string // TODO: flesh this out into a real task type
+	pkgs    []string // TODO: flesh this out into a real task type
+	goCache string   // "rw", "ro", or "
 
 	c           *Controller
 	id          string // rand hex

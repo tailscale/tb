@@ -29,6 +29,7 @@ import (
 	"os/exec"
 	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -120,7 +121,10 @@ func (w webWriter) Write(p []byte) (n int, err error) {
 }
 
 func test(w http.ResponseWriter, r *http.Request) {
-	pkg := strings.TrimPrefix(r.RequestURI, "/test/")
+	query := r.URL.Query()
+	cacheServer := query.Get("cache-server")
+	cacheServerVerbose, _ := strconv.ParseBool(query.Get("cache-server-verbose"))
+	pkg := query.Get("pkg")
 	log.Printf("testing %v ...", pkg)
 	t0 := time.Now()
 	cmd := exec.Command(filepath.Join(codeDir, "tool/go"), "test", "-json", "-v")
@@ -135,7 +139,9 @@ func test(w http.ResponseWriter, r *http.Request) {
 	cmd.Stderr = &webWriter{2, &mu, je, f}
 	cmd.Env = append(os.Environ(),
 		"HOME="+workDir,
+		fmt.Sprintf("GOCACHEPROG=/usr/local/bin/go-cacher --verbose=%v --cache-server=%s", cacheServerVerbose, cacheServer),
 	)
+
 	for _, v := range r.Header["Test-Env"] {
 		cmd.Env = append(cmd.Env, v)
 	}
@@ -145,12 +151,16 @@ func test(w http.ResponseWriter, r *http.Request) {
 }
 
 func toolGoVersion(w http.ResponseWriter, r *http.Request) {
+	query := r.URL.Query()
+	cacheServer := query.Get("cache-server")
+	cacheServerVerbose, _ := strconv.ParseBool(query.Get("cache-server-verbose"))
 	cmd := exec.Command(filepath.Join(codeDir, "tool/go"), "version")
 	cmd.Dir = codeDir
 	cmd.Stdout = w
 	cmd.Stderr = w
 	cmd.Env = append(os.Environ(),
 		"HOME="+workDir,
+		fmt.Sprintf("GOCACHEPROG=/usr/local/bin/go-cacher --verbose=%v --cache-server=%s", cacheServerVerbose, cacheServer),
 	)
 	cmd.Run()
 }
