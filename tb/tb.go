@@ -97,6 +97,7 @@ func main() {
 		fc: &fly.Client{
 			App:   *workerApp,
 			Token: os.Getenv("FLY_TOKEN"),
+			Base:  "http://_api.internal:4280",
 		},
 	}
 	debugger := tsweb.Debugger(c.tsnetMux)
