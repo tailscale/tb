@@ -352,18 +352,13 @@ func (c *Controller) bestEffortDeleteMachine(id fly.MachineID) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	err := c.fc.StopMachine(ctx, id, &fly.StopParam{Signal: "kill", Timeout: time.Nanosecond})
-	log.Printf("stop machine = %v", err)
-
-	for ctx.Err() == nil {
-		err = c.fc.DeleteMachine(ctx, id)
-		log.Printf("delete of machine %v: err=%v", id, err)
-		if err == nil {
-			metricDeleteMachineOK.Add(1)
-			return
-		}
-		time.Sleep(time.Second)
+	err := c.fc.DeleteMachine(ctx, id)
+	log.Printf("delete of machine %v: err=%v", id, err)
+	if err != nil {
+		metricDeleteMachineErr.Add(1)
+		return
 	}
+	metricDeleteMachineOK.Add(1)
 }
 
 func (c *Controller) serveFetch(w http.ResponseWriter, r *http.Request) {

@@ -157,7 +157,8 @@ func (c *Client) StartMachine(ctx context.Context, id MachineID) error {
 }
 
 func (c *Client) DeleteMachine(ctx context.Context, id MachineID) error {
-	return c.toMachineID(ctx, "DELETE", id, "", nil)
+	// Note the undocumented ?force=true query param. :)
+	return c.toMachineID(ctx, "DELETE", id, "?force=true", nil)
 }
 
 func isNilPtr(v any) bool {
