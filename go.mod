@@ -4,7 +4,10 @@ go 1.21
 
 toolchain go1.21.3
 
-require tailscale.com v1.50.1
+require (
+	github.com/bradfitz/go-tool-cache v0.0.0-20230425225207-ef6c7b1b26e9
+	tailscale.com v1.50.1
+)
 
 require (
 	filippo.io/edwards25519 v1.0.0 // indirect
