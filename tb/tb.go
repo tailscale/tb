@@ -42,6 +42,7 @@ import (
 	"time"
 
 	"github.com/bradfitz/go-tool-cache/cachers"
+	"github.com/goproxy/goproxy"
 	"github.com/tailscale/tb/fly"
 	"github.com/tailscale/tb/tb/tbtype"
 	"tailscale.com/syncs"
@@ -87,6 +88,22 @@ func main() {
 	}
 	goCache := &goCacheServer{
 		cache: &cachers.DiskCache{Dir: goCacheDir},
+	}
+
+	goProxyCacheDir := filepath.Join(*cacheDir, "goproxy")
+	if err := os.MkdirAll(goProxyCacheDir, 0755); err != nil {
+		log.Fatal(err)
+	}
+	goProxyHandler := &goproxy.Goproxy{
+		GoBinName: "/usr/bin/false", // should never be used
+		GoBinEnv: []string{
+			"GOPROXY=https://proxy.golang.org",
+		},
+		// TODO(bradfitz): wrap this Cacher in one with metrics
+		Cacher:              goproxy.DirCacher(goProxyCacheDir),
+		CacherMaxCacheBytes: 20 << 30,
+		Transport:           http.DefaultTransport,
+		ErrorLogger:         log.Default(),
 	}
 
 	c := &Controller{
@@ -140,6 +157,9 @@ func main() {
 	}()
 	go func() {
 		errc <- fmt.Errorf("http.Serve(gocache 8081): %w", http.ListenAndServe(":8081", goCache))
+	}()
+	go func() {
+		errc <- fmt.Errorf("goproxy: %w", http.ListenAndServe(":8082", goProxyHandler))
 	}()
 
 	log.Fatal(<-errc)
@@ -673,6 +693,7 @@ func (c *WorkerClient) Test(ctx context.Context, w io.Writer, pkg string) error 
 	if err != nil {
 		return err
 	}
+	req.Header.Add("Test-Env", "GOPROXY=http://["+os.Getenv("FLY_PRIVATE_IP")+"]:8082")
 
 	res, err := http.DefaultClient.Do(req)
 	if err != nil {
