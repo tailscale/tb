@@ -33,6 +33,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 const (
@@ -68,6 +70,19 @@ func main() {
 	if err := os.MkdirAll(workDir, 0755); err != nil {
 		log.Fatal(err)
 	}
+
+	if err := unix.Mount("/dev/tmpfs", workDir, "tmpfs", 0, ""); err != nil {
+		log.Fatal(err)
+	}
+	if false {
+		mounts, _ := os.ReadFile("/proc/mounts")
+		log.Printf("Mounts: %s", mounts)
+		modules, _ := os.ReadFile("/proc/modules")
+		log.Printf("Modules: %s", modules)
+		filesystems, _ := os.ReadFile("/proc/filesystems")
+		log.Printf("Filesystems: %s", filesystems)
+	}
+
 	if err := os.MkdirAll(codeDir, 0755); err != nil {
 		log.Fatal(err)
 	}
