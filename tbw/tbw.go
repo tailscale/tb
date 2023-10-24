@@ -38,8 +38,9 @@ import (
 )
 
 const (
-	workDir = "/home/workdir"      // and HOME
-	codeDir = "/home/workdir/code" // where the repo gets pushed
+	workDir     = "/home/workdir"      // and HOME
+	codeDir     = "/home/workdir/code" // where the repo gets pushed
+	goCacherDir = "/home/workdir/.cache/go-cacher"
 )
 
 func main() {
@@ -84,6 +85,9 @@ func main() {
 	}
 
 	if err := os.MkdirAll(codeDir, 0755); err != nil {
+		log.Fatal(err)
+	}
+	if err := os.MkdirAll(goCacherDir, 0755); err != nil {
 		log.Fatal(err)
 	}
 
@@ -154,7 +158,7 @@ func test(w http.ResponseWriter, r *http.Request) {
 	cmd.Stderr = &webWriter{2, &mu, je, f}
 	cmd.Env = append(os.Environ(),
 		"HOME="+workDir,
-		fmt.Sprintf("GOCACHEPROG=/usr/local/bin/go-cacher --verbose=%v --cache-server=%s", cacheServerVerbose, cacheServer),
+		fmt.Sprintf("GOCACHEPROG=/usr/local/bin/go-cacher --verbose=%v --cache-server=%s --cache-dir=%s", cacheServerVerbose, cacheServer, goCacherDir),
 	)
 
 	for _, v := range r.Header["Test-Env"] {
@@ -175,7 +179,7 @@ func toolGoVersion(w http.ResponseWriter, r *http.Request) {
 	cmd.Stderr = w
 	cmd.Env = append(os.Environ(),
 		"HOME="+workDir,
-		fmt.Sprintf("GOCACHEPROG=/usr/local/bin/go-cacher --verbose=%v --cache-server=%s", cacheServerVerbose, cacheServer),
+		fmt.Sprintf("GOCACHEPROG=/usr/local/bin/go-cacher --verbose=%v --cache-server=%s --cache-dir=%s", cacheServerVerbose, cacheServer, goCacherDir),
 	)
 	cmd.Run()
 }

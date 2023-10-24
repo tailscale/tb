@@ -45,6 +45,8 @@ import (
 	"github.com/goproxy/goproxy"
 	"github.com/tailscale/tb/fly"
 	"github.com/tailscale/tb/tb/tbtype"
+	"go4.org/mem"
+	"golang.org/x/sync/errgroup"
 	"tailscale.com/syncs"
 	"tailscale.com/tsnet"
 	"tailscale.com/tsweb"
@@ -800,15 +802,14 @@ func (r *Run) run() error {
 	}
 	toolchain := strings.TrimSpace(string(toolChainOut))
 
-	s := r.startSpan("get-toolchain-tgz")
-	// TODO(bradfitz): fetch this tarball async. add some lazy concurrent type with a context.
-	toolChainTarball, err := r.c.getToolchainTarball(r.ctx, toolchain)
-	s.end(err)
-	if err != nil {
-		return fmt.Errorf("getting toolchain: %v", err)
-	}
+	toolChainTarball := GetLazy(func() (mem.RO, error) {
+		s := r.startSpan("get-toolchain-tgz")
+		v, err := r.c.getToolchainTarball(r.ctx, toolchain)
+		s.end(err)
+		return v, err
+	})
 
-	s = r.startSpan("create-machine1")
+	s := r.startSpan("create-machine1")
 	machineRand := rands.HexString(16)
 	aliveCh := make(chan bool, 1)
 	r.c.registerMachineAliveChan(machineRand, aliveCh)
@@ -846,21 +847,37 @@ func (r *Run) run() error {
 	tgzURL := fmt.Sprintf("http://[%s]:8080/archive?hash=%s&ref=%s",
 		os.Getenv("FLY_PRIVATE_IP"), r.fetch.Hash, url.QueryEscape(r.fetch.LocalRef))
 
-	if err := r.runSpan("push-work-tree", func() error { return wc.PushTreeFromURL(r.ctx, "code", tgzURL) }); err != nil {
-		return fmt.Errorf("PushTreeFromURL = %w", err)
+	var eg errgroup.Group
+	eg.Go(func() error {
+		if err := r.runSpan("push-work-tree", func() error { return wc.PushTreeFromURL(r.ctx, "code", tgzURL) }); err != nil {
+			return fmt.Errorf("PushTreeFromURL = %w", err)
+		}
+		return nil
+	})
+	eg.Go(func() error {
+		if err := r.runSpan("push-go-toolchain", func() error {
+			tgz, err := toolChainTarball.Get(r.ctx)
+			if err != nil {
+				return err
+			}
+			return wc.PushTreeFromReader(r.ctx, "tailscale-go/"+toolchain, mem.NewReader(tgz))
+		}); err != nil {
+			return fmt.Errorf("PushTreeFromReader = %w", err)
+		}
+		return nil
+	})
+	if err := eg.Wait(); err != nil {
+		return err
 	}
-	if err := r.runSpan("push-go-toolchain", func() error {
-		return wc.PushTreeFromReader(r.ctx, "tailscale-go/"+toolchain, bytes.NewReader(toolChainTarball))
-	}); err != nil {
-		return fmt.Errorf("PushTreeFromReader = %w", err)
-	}
-
-	s = r.startSpan("check-go")
-	v, err := wc.CheckGo(r.ctx)
-	s.end(err)
-	fmt.Fprintf(r, "CheckGo = %q, %v\n", v, err)
 
 	for _, pkg := range r.pkgs {
+		if pkg == "check-go" {
+			s = r.startSpan("check-go")
+			v, err := wc.CheckGo(r.ctx)
+			s.end(err)
+			fmt.Fprintf(r, "CheckGo = %q, %v\n", v, err)
+			continue
+		}
 		r.runSpan("test-"+pkg, func() error { return wc.Test(r.ctx, r, pkg) })
 	}
 
@@ -874,51 +891,77 @@ var (
 	metricToolChainErr    = expvar.NewInt("counter_toolchain_err")
 )
 
-func (c *Controller) getToolchainTarball(ctx context.Context, goHash string) (tgz []byte, retErr error) {
+func (c *Controller) getToolchainTarball(ctx context.Context, goHash string) (tgz mem.RO, retErr error) {
+	var zero mem.RO
 	defer func() {
 		if retErr != nil {
 			metricToolChainErr.Add(1)
 		}
 	}()
 	if !hashRx.MatchString(goHash) {
-		return nil, fmt.Errorf("bad hash")
+		return zero, fmt.Errorf("bad hash")
 	}
 
 	cacheDir := filepath.Join(c.cacheRoot, "toolchain")
 	if err := os.MkdirAll(cacheDir, 0755); err != nil {
-		return nil, err
+		return zero, err
 	}
 	cacheFile := filepath.Join(cacheDir, goHash+".tar.gz")
 	if all, err := os.ReadFile(cacheFile); err == nil {
 		metricToolChainHit.Add(1)
-		return all, nil
+		return mem.B(all), nil
 	}
 	metricToolChainMiss.Add(1)
 	req, err := http.NewRequestWithContext(ctx, "GET", "https://github.com/tailscale/go/releases/download/build-"+goHash+"/linux-amd64.tar.gz", nil)
 	if err != nil {
-		return nil, err
+		return zero, err
 	}
 	res, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return nil, err
+		return zero, err
 	}
 	defer res.Body.Close()
 	if res.StatusCode != 200 {
-		return nil, fmt.Errorf("bad status: %v", res.Status)
+		return zero, fmt.Errorf("bad status: %v", res.Status)
 	}
 	all, err := io.ReadAll(res.Body)
 	if err != nil {
-		return nil, err
+		return zero, err
 	}
 	tmpFile := cacheFile + ".tmp"
 	if err := os.WriteFile(tmpFile, all, 0644); err != nil {
-		return nil, err
+		return zero, err
 	}
 	if err := os.Rename(tmpFile, cacheFile); err != nil {
-		return nil, err
+		return zero, err
 	}
 	metricToolChainFilled.Add(1)
-	return all, nil
+	return mem.B(all), nil
+}
+
+type Lazy[T any] struct {
+	ready chan struct{} // closed on done
+	v     T
+	err   error
+}
+
+func GetLazy[T any](f func() (T, error)) *Lazy[T] {
+	lv := &Lazy[T]{ready: make(chan struct{})}
+	go func() {
+		lv.v, lv.err = f()
+		close(lv.ready)
+	}()
+	return lv
+}
+
+func (lv *Lazy[T]) Get(ctx context.Context) (T, error) {
+	select {
+	case <-lv.ready:
+		return lv.v, lv.err
+	case <-ctx.Done():
+		var zero T
+		return zero, ctx.Err()
+	}
 }
 
 // somePackages is a temporary (2023-10-21) list of packages in the tailscale.com
