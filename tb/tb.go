@@ -723,11 +723,12 @@ type Run struct {
 	createdAt   time.Time
 	workerImage string
 
-	mu     sync.Mutex
-	doneAt time.Time
-	err    error
-	buf    bytes.Buffer
-	spans  []*span
+	mu        sync.Mutex
+	doneAt    time.Time
+	err       error
+	buf       bytes.Buffer
+	spans     []*span
+	spansOpen int
 }
 
 func (r *Run) Run() {
@@ -768,6 +769,7 @@ func (r *Run) startSpan(name string) *span {
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.spansOpen++
 	r.spans = append(r.spans, s)
 	fmt.Fprintf(&r.buf, "[+%10s] span %q started\n", s.startAt.Sub(r.createdAt).Round(time.Millisecond).String(), name)
 	return s
@@ -788,6 +790,10 @@ func (s *span) end(err error) error {
 		s.name,
 		s.endAt.Sub(s.startAt).Round(time.Millisecond),
 		res)
+	r.spansOpen--
+	if r.spansOpen == 0 {
+		fmt.Fprintf(&r.buf, "--\n")
+	}
 	return err
 }
 
