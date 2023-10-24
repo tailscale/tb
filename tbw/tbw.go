@@ -29,12 +29,11 @@ import (
 	"os/exec"
 	"path"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
-
-	"golang.org/x/sys/unix"
 )
 
 const (
@@ -42,6 +41,10 @@ const (
 	codeDir     = "/home/workdir/code" // where the repo gets pushed
 	goCacherDir = "/home/workdir/.cache/go-cacher"
 )
+
+// linuxMount is the Linux signature of x/sys/unix.Mount.
+// It's set in init by tbw_linux.go.
+var linuxMount func(source string, target string, fstype string, flags uintptr, data string) error
 
 func main() {
 	dur, _ := time.ParseDuration(os.Getenv("VM_MAX_DURATION"))
@@ -72,16 +75,14 @@ func main() {
 		log.Fatal(err)
 	}
 
-	if err := unix.Mount("/dev/tmpfs", workDir, "tmpfs", 0, ""); err != nil {
-		log.Fatal(err)
-	}
-	if false {
-		mounts, _ := os.ReadFile("/proc/mounts")
-		log.Printf("Mounts: %s", mounts)
-		modules, _ := os.ReadFile("/proc/modules")
-		log.Printf("Modules: %s", modules)
-		filesystems, _ := os.ReadFile("/proc/filesystems")
-		log.Printf("Filesystems: %s", filesystems)
+	if runtime.GOOS == "linux" {
+		if err := linuxMount("/dev/tmpfs", workDir, "tmpfs", 0, ""); err != nil {
+			log.Fatal(err)
+		}
+		if os.Getenv("FLY_REGION") != "" {
+			mounts, _ := os.ReadFile("/proc/mounts")
+			log.Printf("Mounts: %s", mounts)
+		}
 	}
 
 	if err := os.MkdirAll(codeDir, 0755); err != nil {
