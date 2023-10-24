@@ -686,10 +686,12 @@ func (c *WorkerClient) CheckGo(ctx context.Context) (string, error) {
 }
 
 func (c *WorkerClient) Test(ctx context.Context, w io.Writer, pkg string) error {
+	pkg, run, _ := strings.Cut(pkg, "!") // TODO(bradfitz): temporary hack to smuggle run arg
 	ctx, cancel := context.WithTimeout(ctx, 15*time.Minute)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, "GET", "http://["+c.m.PrivateIP.String()+"]:8080/test?"+(url.Values{
 		"pkg":          {pkg},
+		"run":          {run},
 		"cache-server": {cacheServerAddr()},
 	}).Encode(), nil)
 	if err != nil {
@@ -705,7 +707,76 @@ func (c *WorkerClient) Test(ctx context.Context, w io.Writer, pkg string) error 
 	if res.StatusCode != 200 {
 		return fmt.Errorf("testing %v: %v", pkg, res.Status)
 	}
-	io.Copy(w, res.Body)
+
+	// TODO: wrap w with a version that has a mutex if it doesn't already
+
+	// stdout stream
+	stdoutRead, stdoutWrite := io.Pipe()
+	var eg errgroup.Group
+	eg.Go(func() error {
+		d := json.NewDecoder(stdoutRead)
+		for {
+			var testEvent struct {
+				Time    time.Time // encodes as an RFC3339-format string
+				Action  string
+				Package string
+				Test    string
+				Elapsed float64 // seconds
+				Output  string
+			}
+			if err := d.Decode(&testEvent); err != nil {
+				if errors.Is(err, io.EOF) {
+					return nil
+				}
+				return err
+			}
+			if testEvent.Output != "" {
+				io.WriteString(w, testEvent.Output)
+				continue
+			}
+		}
+	})
+
+	defer func() {
+		if err := eg.Wait(); err != nil {
+			fmt.Fprintf(w, "stdout JSON reading error: %v", err)
+		}
+	}()
+	defer stdoutWrite.Close()
+
+	d := json.NewDecoder(res.Body)
+	for {
+		var line []any
+		if err := d.Decode(&line); err != nil {
+			return err
+		}
+		if len(line) < 2 {
+			fmt.Fprintf(w, "got: %#v\n", line)
+			continue
+		}
+		typ, ok := line[0].(float64)
+		if !ok {
+			continue
+		}
+		str, ok := line[1].(string)
+		if !ok {
+			fmt.Fprintf(w, "got: %T %T\n", line[0], line[1])
+			continue
+		}
+		if typ == 2 { // stderr
+			if suf, ok := strings.CutPrefix(str, "go: downloading "); ok {
+				io.WriteString(w, "📦 "+suf)
+				continue
+			}
+			io.WriteString(w, "⚠️ "+str)
+			continue
+		}
+		if typ == 1 { // stdout
+			io.WriteString(stdoutWrite, str)
+			continue
+		}
+		fmt.Fprintf(w, "got: %v %q\n", line[0], line[1])
+	}
 	return nil
 }
 

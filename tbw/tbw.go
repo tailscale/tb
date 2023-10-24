@@ -143,11 +143,12 @@ func (w webWriter) Write(p []byte) (n int, err error) {
 func test(w http.ResponseWriter, r *http.Request) {
 	query := r.URL.Query()
 	cacheServer := query.Get("cache-server")
+	runArg := query.Get("run")
 	cacheServerVerbose, _ := strconv.ParseBool(query.Get("cache-server-verbose"))
 	pkg := query.Get("pkg")
 	log.Printf("testing %v ...", pkg)
 	t0 := time.Now()
-	cmd := exec.Command(filepath.Join(codeDir, "tool/go"), "test", "-json", "-v")
+	cmd := exec.Command(filepath.Join(codeDir, "tool/go"), "test", "-json", "-v", "-run="+runArg)
 
 	var mu sync.Mutex
 	je := json.NewEncoder(w)
