@@ -34,7 +34,6 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
-	"path"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -495,34 +494,51 @@ func (c *Controller) serveArchive(w http.ResponseWriter, r *http.Request) {
 
 func (c *Controller) serveStartBuild(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	ref := r.FormValue("ref")
-	var pkgs []string
-	pkg := r.FormValue("pkg")
-	goCache := r.FormValue("gocache") // "rw", "ro", or "" for none
-	switch pkg {
-	case "":
-		pkgs = []string{"tailscale.com/util/lru", "tailscale.com/util/cmpx"}
-	case "all":
-		for _, v := range strings.Fields(somePackages) {
-			pkgs = append(pkgs, path.Join("tailscale.com", v))
-		}
-	default:
-		pkgs = strings.Fields(pkg)
-		for i, v := range pkgs {
-			if !strings.Contains(v, ".") {
-				pkgs[i] = "tailscale.com/" + v
+
+	if r.Method != "POST" {
+		http.Error(w, "bad method", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req tbtype.BuildRequest
+	if r.Header.Get("Content-Type") == "application/x-www-form-urlencoded" {
+		req.Ref = r.FormValue("ref")
+		pkg := r.FormValue("pkg")
+		switch pkg {
+		case "":
+			req.Tasks = []*tbtype.Task{
+				{Name: "lru", GOOS: "linux", GOARCH: "amd64", Action: "test", Packages: []string{"tailscale.com/util/lru"}},
+				{Name: "lru", GOOS: "linux", GOARCH: "amd64", Action: "test", Packages: []string{"tailscale.com/util/cmpx"}},
+			}
+		default:
+			pkgs := strings.Fields(pkg)
+			for _, pkg := range pkgs {
+				if !strings.Contains(pkg, ".") {
+					pkg = "tailscale.com/" + pkg
+				}
+				req.Tasks = append(req.Tasks, &tbtype.Task{
+					Name: pkg, GOOS: "linux", GOARCH: "amd64", Action: "test", Packages: []string{pkg},
+				})
 			}
 		}
+	} else {
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
 	}
-	if ref == "main" {
+
+	// TODO(bradfitz): finish plumbing/using this goCache stuff
+	goCache := r.FormValue("gocache") // "rw", "ro", or "" for none
+	if req.Ref == "main" {
 		goCache = "rw"
 	}
 
 	run := &Run{
 		c:         c,
+		req:       &req,
 		id:        rands.HexString(32),
 		createdAt: time.Now(),
-		pkgs:      pkgs,
 		goCache:   goCache,
 	}
 
@@ -536,7 +552,7 @@ func (c *Controller) serveStartBuild(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	s := run.startSpan("fetch-ref")
-	fetchRes, err := c.fetch(ref)
+	fetchRes, err := c.fetch(req.Ref)
 	s.end(err)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -784,8 +800,8 @@ type Run struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	pkgs    []string // TODO: flesh this out into a real task type
-	goCache string   // "rw", "ro", or "
+	req     *tbtype.BuildRequest
+	goCache string // "rw", "ro", or "
 
 	c           *Controller
 	id          string // rand hex
@@ -947,15 +963,19 @@ func (r *Run) run() error {
 		return err
 	}
 
-	for _, pkg := range r.pkgs {
-		if pkg == "check-go" {
+	for _, task := range r.req.Tasks {
+		switch task.Action {
+		case "check-go":
 			s = r.startSpan("check-go")
 			v, err := wc.CheckGo(r.ctx)
 			s.end(err)
 			fmt.Fprintf(r, "CheckGo = %q, %v\n", v, err)
-			continue
+		case "test":
+			// TODO(bradfitz): support more than one package per invocation;
+			// overhaul the Test method into a generic Exec method like Go's
+			// buildlet.
+			r.runSpan("task-"+task.Name, func() error { return wc.Test(r.ctx, r, task.Packages[0]) })
 		}
-		r.runSpan("test-"+pkg, func() error { return wc.Test(r.ctx, r, pkg) })
 	}
 
 	return nil
@@ -1040,175 +1060,3 @@ func (lv *Lazy[T]) Get(ctx context.Context) (T, error) {
 		return zero, ctx.Err()
 	}
 }
-
-// somePackages is a temporary (2023-10-21) list of packages in the tailscale.com
-// module for development. It will be removed when we query this dynamically.
-var somePackages = `
-.
-appc
-atomicfile
-chirp
-client/tailscale
-client/web
-clientupdate
-clientupdate/distsign
-cmd/cloner
-cmd/containerboot
-cmd/derper
-cmd/gitops-pusher
-cmd/k8s-operator
-cmd/sniproxy
-cmd/tailscale
-cmd/tailscale/cli
-cmd/tailscaled
-cmd/testwrapper
-cmd/testwrapper/flakytest
-control/controlbase
-control/controlclient
-control/controlhttp
-control/controlknobs
-derp
-derp/derphttp
-disco
-doctor
-doctor/permissions
-envknob/logknob
-health
-hostinfo
-ipn
-ipn/ipnlocal
-ipn/ipnserver
-ipn/localapi
-ipn/store
-ipn/store/awsstore
-jsondb
-log/filelogger
-log/sockstatlog
-logpolicy
-logtail
-logtail/filch
-metrics
-net/art
-net/connstats
-net/dns
-net/dns/publicdns
-net/dns/recursive
-net/dns/resolvconffile
-net/dns/resolver
-net/dnscache
-net/dnsfallback
-net/flowtrack
-net/interfaces
-net/memnet
-net/netcheck
-net/neterror
-net/netmon
-net/netns
-net/netstat
-net/netutil
-net/packet
-net/packet/checksum
-net/ping
-net/portmapper
-net/proxymux
-net/routetable
-net/socks5
-net/sockstats
-net/speedtest
-net/stun
-net/tcpinfo
-net/tlsdial
-net/tsaddr
-net/tsdial
-net/tshttpproxy
-net/tstun
-packages/deb
-portlist
-posture
-prober
-safesocket
-ssh/tailssh
-syncs
-tailcfg
-taildrop
-tempfork/device
-tempfork/gliderlabs/ssh
-tempfork/heap
-tempfork/pprof
-tka
-tool/gocross
-tsnet
-tstest
-tstest/archtest
-tstest/deptest
-tstest/integration
-tstest/integration/vms
-tstest/iosdeps
-tstest/jsdeps
-tstest/natlab
-tstime
-tstime/mono
-tstime/rate
-tsweb
-tsweb/promvarz
-tsweb/varz
-types/appctype
-types/dnstype
-types/ipproto
-types/key
-types/lazy
-types/logger
-types/logid
-types/netlogtype
-types/netmap
-types/opt
-types/persist
-types/tkatype
-types/views
-util/clientmetric
-util/cmpver
-util/cmpx
-util/cstruct
-util/deephash
-util/dirwalk
-util/dnsname
-util/goroutines
-util/hashx
-util/httphdr
-util/httpm
-util/jsonutil
-util/limiter
-util/linuxfw
-util/linuxfw/linuxfwtest
-util/lru
-util/mak
-util/multierr
-util/nocasemaps
-util/osdiag
-util/pidowner
-util/race
-util/rands
-util/ringbuffer
-util/set
-util/singleflight
-util/slicesx
-util/syspolicy
-util/sysresources
-util/testenv
-util/truncate
-util/uniq
-util/vizerror
-util/winutil
-util/winutil/policy
-version
-version/mkversion
-wgengine
-wgengine/filter
-wgengine/magicsock
-wgengine/netstack
-wgengine/router
-wgengine/wgcfg
-wgengine/wgint
-wgengine/wglog
-words
-`

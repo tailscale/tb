@@ -35,3 +35,8 @@ func (t *Task) SetPlatform(p string) error {
 	}
 	return nil
 }
+
+type BuildRequest struct {
+	Ref   string  `json:"ref"`
+	Tasks []*Task `json:"tasks,omitempty"`
+}
