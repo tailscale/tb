@@ -1,33 +1,12 @@
 package main
 
 import (
-	"errors"
 	"fmt"
-	"strings"
 
 	"github.com/robertkrimen/otto"
+	"github.com/tailscale/tb/tb/tbtype"
 	"tailscale.com/util/must"
 )
-
-type Task struct {
-	Name   string `json:",omitempty"`
-	GOOS   string `json:",omitempty"`
-	GOARCH string `json:",omitempty"`
-	Race   bool   `json:",omitempty"`
-
-	Action   string   `json:",omitempty"` // "build", "test", "staticcheck"
-	Packages []string `json:",omitempty"`
-}
-
-func (t *Task) setPlatform(p string) error {
-	p, t.Race = strings.CutSuffix(p, "/race")
-	var ok bool
-	t.GOOS, t.GOARCH, ok = strings.Cut(p, "/")
-	if !ok {
-		return errors.New("no slash in GOOS/GOARCH platform")
-	}
-	return nil
-}
 
 type GoPackage struct {
 	ImportPath string
@@ -38,7 +17,7 @@ type GenerateTasksEnv struct {
 	GetPackages func(platform string) ([]GoPackage, error)
 }
 
-func GenerateTasks(js []byte, env GenerateTasksEnv) (tasks []*Task, retErr error) {
+func GenerateTasks(js []byte, env GenerateTasksEnv) (tasks []*tbtype.Task, retErr error) {
 	defer func() {
 		if e := recover(); e != nil {
 			retErr = fmt.Errorf("error running JS: %v", e)
@@ -69,7 +48,7 @@ func GenerateTasks(js []byte, env GenerateTasksEnv) (tasks []*Task, retErr error
 	})
 
 	vm.Set("addTask", func(call otto.FunctionCall) otto.Value {
-		t := &Task{
+		t := &tbtype.Task{
 			Action: call.Argument(0).String(),
 		}
 		switch t.Action {
@@ -78,7 +57,7 @@ func GenerateTasks(js []byte, env GenerateTasksEnv) (tasks []*Task, retErr error
 		default:
 			panic(fmt.Sprintf("invalid task type %q", t.Action))
 		}
-		t.setPlatform(call.Argument(1).String())
+		t.SetPlatform(call.Argument(1).String())
 		tasks = append(tasks, t)
 		return otto.Value{}
 	})
