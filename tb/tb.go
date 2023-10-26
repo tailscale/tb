@@ -267,6 +267,44 @@ func (c *Controller) runByLocalRef(ref string) *Run {
 	return nil
 }
 
+// getMachine returns a future to an newly created machine.
+// It doesn't take a context because if the caller goes away, we still want to
+// wait for it to be created so we can either shut it down cleanly or give it out
+// to somebody else who does want it.
+func (c *Controller) getMachine(image string) *Lazy[*fly.Machine] {
+	machineRand := rands.HexString(16)
+	aliveCh := make(chan bool, 1)
+	c.registerMachineAliveChan(machineRand, aliveCh)
+	return GetLazy(func() (*fly.Machine, error) {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		defer cancel()
+		return c.fc.CreateMachine(ctx, &fly.CreateMachineRequest{
+			Region: "sea",
+			Config: &fly.MachineConfig{
+				AutoDestroy: true,
+				Env: map[string]string{
+					"VM_MAX_DURATION":    "20m",
+					"REGISTER_ALIVE_URL": "http://[" + os.Getenv("FLY_PRIVATE_IP") + "]:8080/worker-alive/" + machineRand,
+				},
+				Guest: &fly.MachineGuest{
+					MemoryMB: 8192, // required 2048 per core for performance
+					CPUs:     4,
+					CPUKind:  "performance",
+				},
+				Image: image,
+				Restart: &fly.MachineRestart{
+					Policy: "no",
+				},
+			},
+		})
+	})
+}
+
+func (c *Controller) returnMachine(m *fly.Machine) {
+	// TOOD: pool, reuse? For now, just nuke them.
+	go c.bestEffortDeleteMachine(m.ID)
+}
+
 func (c *Controller) registerMachineAliveChan(id string, ch chan bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -527,6 +565,11 @@ func (c *Controller) serveStartBuild(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if req.Machines == 0 {
+		req.Machines = 1
+	} else if req.Machines > 100 {
+		req.Machines = 100
+	}
 
 	// TODO(bradfitz): finish plumbing/using this goCache stuff
 	goCache := r.FormValue("gocache") // "rw", "ro", or "" for none
@@ -581,16 +624,20 @@ func (c *Controller) serveStartBuild(w http.ResponseWriter, r *http.Request) {
 }
 
 type WorkerClient struct {
-	m           *fly.Machine
-	c           *Controller
-	hash        string
-	machineRand string
+	m    *fly.Machine
+	c    *Controller
+	hash string
 }
 
 func (c *WorkerClient) WaitUp(d time.Duration) error {
+	_, machineRand, ok := strings.Cut(c.m.Config.Env["REGISTER_ALIVE_URL"], "/worker-alive/")
+	if !ok || machineRand == "" {
+		return errors.New("failed to find machinerand in machine env")
+	}
+
 	donec := make(chan struct{})
 	defer close(donec)
-	alive := c.c.machineAliveChan(c.machineRand)
+	alive := c.c.machineAliveChan(machineRand)
 	timer := time.NewTimer(d)
 	defer timer.Stop()
 
@@ -780,9 +827,11 @@ func (c *WorkerClient) Test(ctx context.Context, w io.Writer, pkg string) error 
 			continue
 		}
 		if typ == 2 { // stderr
-			if suf, ok := strings.CutPrefix(str, "go: downloading "); ok {
-				io.WriteString(w, "📦 "+suf)
+			s2 := strings.ReplaceAll(str, "go: downloading ", "📦 ")
+			if s2 != str {
+				io.WriteString(w, s2)
 				continue
+
 			}
 			io.WriteString(w, "⚠️ "+str)
 			continue
@@ -810,12 +859,14 @@ type Run struct {
 	createdAt   time.Time
 	workerImage string
 
-	mu        sync.Mutex
-	doneAt    time.Time
-	err       error
-	buf       bytes.Buffer
-	spans     []*span
-	spansOpen int
+	mu              sync.Mutex
+	machinesStarted set.Set[*Lazy[*fly.Machine]]
+	clients         set.Set[*WorkerClient]
+	doneAt          time.Time
+	err             error
+	buf             bytes.Buffer
+	spans           []*span
+	spansOpen       int
 }
 
 func (r *Run) Run() {
@@ -849,13 +900,17 @@ func (r *Run) runSpan(name string, f func() error) error {
 }
 
 func (r *Run) startSpan(name string) *span {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.startSpanLocked(name)
+}
+
+func (r *Run) startSpanLocked(name string) *span {
 	s := &span{
 		name:    name,
 		r:       r,
 		startAt: time.Now(),
 	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
 	r.spansOpen++
 	r.spans = append(r.spans, s)
 	fmt.Fprintf(&r.buf, "[+%10s] span %q started\n", s.startAt.Sub(r.createdAt).Round(time.Millisecond).String(), name)
@@ -884,8 +939,46 @@ func (s *span) end(err error) error {
 	return err
 }
 
+func (r *Run) getUpMachine() (*WorkerClient, error) {
+	r.mu.Lock()
+	n := len(r.machinesStarted) + 1
+	s := r.startSpanLocked(fmt.Sprintf("create-machine-%d", n))
+	lm := r.c.getMachine(r.workerImage)
+	if r.machinesStarted == nil {
+		r.machinesStarted = set.Set[*Lazy[*fly.Machine]]{}
+	}
+	r.machinesStarted.Add(lm)
+	r.mu.Unlock()
+
+	m, err := lm.Get(r.ctx)
+	s.end(err)
+	if err != nil {
+		return nil, err
+	}
+
+	wc := &WorkerClient{m: m, c: r.c, hash: r.fetch.Hash}
+	s = r.startSpan(fmt.Sprintf("wait-up-%d", n))
+	if err := s.end(wc.WaitUp(15 * time.Second)); err != nil {
+		return nil, fmt.Errorf("WorkerClient.WaitUp = %w", err)
+	}
+	return wc, nil
+}
+
+func (r *Run) cleanup() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for lm := range r.machinesStarted {
+		lm := lm
+		go func() {
+			if m, err := lm.Get(context.Background()); err == nil {
+				r.c.returnMachine(m)
+			}
+		}()
+	}
+}
+
 func (r *Run) run() error {
-	fc := r.c.fc
+	defer r.cleanup()
 
 	cmd := exec.Command("git", "show", r.fetch.Hash+":go.toolchain.rev")
 	cmd.Dir = r.c.gitDir
@@ -902,39 +995,9 @@ func (r *Run) run() error {
 		return v, err
 	})
 
-	s := r.startSpan("create-machine1")
-	machineRand := rands.HexString(16)
-	aliveCh := make(chan bool, 1)
-	r.c.registerMachineAliveChan(machineRand, aliveCh)
-	m, err := fc.CreateMachine(r.ctx, &fly.CreateMachineRequest{
-		Region: "sea",
-		Config: &fly.MachineConfig{
-			AutoDestroy: true,
-			Env: map[string]string{
-				"VM_MAX_DURATION":    "20m",
-				"REGISTER_ALIVE_URL": "http://[" + os.Getenv("FLY_PRIVATE_IP") + "]:8080/worker-alive/" + machineRand,
-			},
-			Guest: &fly.MachineGuest{
-				MemoryMB: 8192, // required 2048 per core for performance
-				CPUs:     4,
-				CPUKind:  "performance",
-			},
-			Image: r.workerImage,
-			Restart: &fly.MachineRestart{
-				Policy: "no",
-			},
-		},
-	})
-	s.end(err)
+	wc, err := r.getUpMachine()
 	if err != nil {
-		return fmt.Errorf("CreateMachine: %w", err)
-	}
-	defer func() { go r.c.bestEffortDeleteMachine(m.ID) }()
-
-	wc := &WorkerClient{m: m, c: r.c, hash: r.fetch.Hash, machineRand: machineRand}
-	s = r.startSpan("wait-up1")
-	if err := s.end(wc.WaitUp(15 * time.Second)); err != nil {
-		return fmt.Errorf("WorkerClient.WaitUp = %w", err)
+		return err
 	}
 
 	tgzURL := fmt.Sprintf("http://[%s]:8080/archive?hash=%s&ref=%s",
@@ -966,7 +1029,7 @@ func (r *Run) run() error {
 	for _, task := range r.req.Tasks {
 		switch task.Action {
 		case "check-go":
-			s = r.startSpan("check-go")
+			s := r.startSpan("check-go")
 			v, err := wc.CheckGo(r.ctx)
 			s.end(err)
 			fmt.Fprintf(r, "CheckGo = %q, %v\n", v, err)
