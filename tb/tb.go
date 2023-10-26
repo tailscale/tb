@@ -852,12 +852,16 @@ type Run struct {
 	req     *tbtype.BuildRequest
 	goCache string // "rw", "ro", or "
 
-	c           *Controller
-	id          string // rand hex
-	fetch       *tbtype.FetchResponse
-	base        *fly.Machine
-	createdAt   time.Time
-	workerImage string
+	c         *Controller
+	id        string // rand hex
+	fetch     *tbtype.FetchResponse
+	base      *fly.Machine
+	createdAt time.Time
+
+	// populated during run, owned by run's goroutine
+	workerImage      string
+	toolchain        string
+	toolChainTarball *Lazy[mem.RO]
 
 	mu              sync.Mutex
 	machinesStarted set.Set[*Lazy[*fly.Machine]]
@@ -939,10 +943,13 @@ func (s *span) end(err error) error {
 	return err
 }
 
-func (r *Run) getUpMachine() (*WorkerClient, error) {
+func (r *Run) getUsableMachine() (_ *WorkerClient, retErr error) {
 	r.mu.Lock()
 	n := len(r.machinesStarted) + 1
-	s := r.startSpanLocked(fmt.Sprintf("create-machine-%d", n))
+	spanUsable := r.startSpanLocked(fmt.Sprintf("get-usable-machine-%d", n))
+	defer func() { spanUsable.end(retErr) }()
+
+	spanMachine := r.startSpanLocked(fmt.Sprintf("create-machine-%d", n))
 	lm := r.c.getMachine(r.workerImage)
 	if r.machinesStarted == nil {
 		r.machinesStarted = set.Set[*Lazy[*fly.Machine]]{}
@@ -951,16 +958,43 @@ func (r *Run) getUpMachine() (*WorkerClient, error) {
 	r.mu.Unlock()
 
 	m, err := lm.Get(r.ctx)
-	s.end(err)
+	spanMachine.end(err)
 	if err != nil {
 		return nil, err
 	}
 
 	wc := &WorkerClient{m: m, c: r.c, hash: r.fetch.Hash}
-	s = r.startSpan(fmt.Sprintf("wait-up-%d", n))
-	if err := s.end(wc.WaitUp(15 * time.Second)); err != nil {
+	spanReach := r.startSpan(fmt.Sprintf("wait-reachable-%d", n))
+	if err := spanReach.end(wc.WaitUp(15 * time.Second)); err != nil {
 		return nil, fmt.Errorf("WorkerClient.WaitUp = %w", err)
 	}
+
+	tgzURL := fmt.Sprintf("http://[%s]:8080/archive?hash=%s&ref=%s",
+		os.Getenv("FLY_PRIVATE_IP"), r.fetch.Hash, url.QueryEscape(r.fetch.LocalRef))
+
+	var eg errgroup.Group
+	eg.Go(func() error {
+		if err := r.runSpan("push-work-tree", func() error { return wc.PushTreeFromURL(r.ctx, "code", tgzURL) }); err != nil {
+			return fmt.Errorf("PushTreeFromURL = %w", err)
+		}
+		return nil
+	})
+	eg.Go(func() error {
+		if err := r.runSpan("push-go-toolchain", func() error {
+			tgz, err := r.toolChainTarball.Get(r.ctx)
+			if err != nil {
+				return err
+			}
+			return wc.PushTreeFromReader(r.ctx, "tailscale-go/"+r.toolchain, mem.NewReader(tgz))
+		}); err != nil {
+			return fmt.Errorf("PushTreeFromReader = %w", err)
+		}
+		return nil
+	})
+	if err := eg.Wait(); err != nil {
+		return nil, err
+	}
+
 	return wc, nil
 }
 
@@ -986,43 +1020,16 @@ func (r *Run) run() error {
 	if err != nil {
 		return fmt.Errorf("looking up go.toolchain.rev for %v: %v", r.fetch.Hash, err)
 	}
-	toolchain := strings.TrimSpace(string(toolChainOut))
-
-	toolChainTarball := GetLazy(func() (mem.RO, error) {
+	r.toolchain = strings.TrimSpace(string(toolChainOut))
+	r.toolChainTarball = GetLazy(func() (mem.RO, error) {
 		s := r.startSpan("get-toolchain-tgz")
-		v, err := r.c.getToolchainTarball(r.ctx, toolchain)
+		v, err := r.c.getToolchainTarball(r.ctx, r.toolchain)
 		s.end(err)
 		return v, err
 	})
 
-	wc, err := r.getUpMachine()
+	wc, err := r.getUsableMachine()
 	if err != nil {
-		return err
-	}
-
-	tgzURL := fmt.Sprintf("http://[%s]:8080/archive?hash=%s&ref=%s",
-		os.Getenv("FLY_PRIVATE_IP"), r.fetch.Hash, url.QueryEscape(r.fetch.LocalRef))
-
-	var eg errgroup.Group
-	eg.Go(func() error {
-		if err := r.runSpan("push-work-tree", func() error { return wc.PushTreeFromURL(r.ctx, "code", tgzURL) }); err != nil {
-			return fmt.Errorf("PushTreeFromURL = %w", err)
-		}
-		return nil
-	})
-	eg.Go(func() error {
-		if err := r.runSpan("push-go-toolchain", func() error {
-			tgz, err := toolChainTarball.Get(r.ctx)
-			if err != nil {
-				return err
-			}
-			return wc.PushTreeFromReader(r.ctx, "tailscale-go/"+toolchain, mem.NewReader(tgz))
-		}); err != nil {
-			return fmt.Errorf("PushTreeFromReader = %w", err)
-		}
-		return nil
-	})
-	if err := eg.Wait(); err != nil {
 		return err
 	}
 
