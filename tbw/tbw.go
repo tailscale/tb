@@ -18,6 +18,7 @@ package main
 import (
 	"archive/tar"
 	"compress/gzip"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -34,6 +35,10 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
+
+	"github.com/tailscale/tb/tb/tbtype"
+	"tailscale.com/types/ptr"
 )
 
 const (
@@ -108,6 +113,7 @@ func main() {
 		}
 		os.Exit(0)
 	}))
+	m.HandleFunc("/exec", serveExec)
 	m.HandleFunc("/test/", test)
 	m.HandleFunc("/check/go-version", toolGoVersion)
 	m.HandleFunc("/env", env)
@@ -132,7 +138,18 @@ type webWriter struct {
 func (w webWriter) Write(p []byte) (n int, err error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	err = w.je.Encode([]any{w.typ, string(p)})
+	var s tbtype.ExecStream
+	switch {
+	case w.typ == 1 && utf8.Valid(p):
+		s.O = string(p)
+	case w.typ == 1:
+		s.OB = p
+	case w.typ == 2 && utf8.Valid(p):
+		s.E = string(p)
+	case w.typ == 2:
+		s.EB = p
+	}
+	err = w.je.Encode(&s)
 	if err != nil {
 		return 0, err
 	}
@@ -169,6 +186,102 @@ func test(w http.ResponseWriter, r *http.Request) {
 	err := cmd.Run()
 	d := time.Since(t0).Round(time.Millisecond)
 	log.Printf("test of %v = %v in %v", pkg, err, d)
+
+	final := &tbtype.ExecStream{
+		Dur: d.Seconds(),
+	}
+	if err != nil {
+		final.Err = err.Error()
+	} else {
+		final.Exit = ptr.To(0)
+	}
+	if ee, ok := err.(*exec.ExitError); ok {
+		final.Exit = ptr.To(ee.ExitCode())
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	je.Encode(final)
+}
+
+var expander = strings.NewReplacer(
+	"${CODEDIR}", codeDir,
+	"${HOME}", workDir,
+)
+
+func serveExec(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "POST required", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req tbtype.ExecRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		log.Printf("bad ExecRequest JSON: %v", err)
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// Expand any literal ${CODEDIR} and ${HOME} in strings.
+	expand := func(s *string) { *s = expander.Replace(*s) }
+	expand(&req.Dir)
+	expand(&req.Cmd)
+	for i := range req.Args {
+		expand(&req.Args[i])
+	}
+	for i := range req.Env {
+		expand(&req.Env[i])
+	}
+
+	ctx := r.Context()
+	if req.TimeoutSeconds != 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, time.Duration(req.TimeoutSeconds*float64(time.Second)))
+		defer cancel()
+	}
+
+	cmdPath := req.Cmd
+	if strings.HasPrefix(req.Cmd, "./") {
+		cmdPath = filepath.Join(codeDir, req.Cmd)
+	}
+
+	cmd := exec.CommandContext(ctx, cmdPath, req.Args...)
+	cmd.Dir = cmd.Dir
+	if cmd.Dir == "" {
+		cmd.Dir = codeDir
+	}
+
+	var mu sync.Mutex
+	je := json.NewEncoder(w)
+	f := w.(http.Flusher)
+
+	cmd.Dir = codeDir
+	cmd.Stdout = &webWriter{1, &mu, je, f}
+	cmd.Stderr = &webWriter{2, &mu, je, f}
+	cmd.Env = append(os.Environ(), "HOME="+workDir)
+	cmd.Env = append(cmd.Env, req.Env...)
+
+	t0 := time.Now()
+	err := cmd.Run()
+	d := time.Since(t0).Round(time.Millisecond)
+
+	final := &tbtype.ExecStream{
+		Dur: d.Seconds(),
+	}
+	if err != nil {
+		final.Err = err.Error()
+	} else {
+		final.Exit = ptr.To(0)
+	}
+	if ee, ok := err.(*exec.ExitError); ok {
+		final.Exit = ptr.To(ee.ExitCode())
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	je.Encode(final)
+
+	log.Printf("exec of %q %q = %v in %v", cmdPath, req.Args, err, d)
 }
 
 func toolGoVersion(w http.ResponseWriter, r *http.Request) {

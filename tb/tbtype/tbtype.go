@@ -41,3 +41,29 @@ type BuildRequest struct {
 	Tasks    []*Task `json:"tasks,omitempty"`
 	Machines int     `json:"machines,omitempty"`
 }
+
+// ExecRequest is a request from the controller to the worker buildlet to
+// execute a command. It's not sent by end users.
+//
+// For all args, ${CODEDIR} and ${HOME} interpolate.
+type ExecRequest struct {
+	Dir  string // empty means ${CODEDIR}
+	Cmd  string // leading "./" means relative to ${CODEDIR}
+	Args []string
+	Env  []string
+
+	MergeStderrIntoStdout bool
+	TimeoutSeconds        float64 // 0 means no timeout
+}
+
+type ExecStream struct {
+	O  string `json:",omitempty"` // stdout, if valid UTF-8
+	OB []byte `json:",omitempty"` // stdout, if not UTF-8
+	E  string `json:",omitempty"` // stderr, if valid UTF-8
+	EB []byte `json:",omitempty"` // stderr, if not UTF-8
+
+	// Final message includes:
+	Exit *int    `json:",omitempty"` // exit status, if exited (pointer to zero on success)
+	Dur  float64 `json:",omitempty"` // seconds it took to run, at exit
+	Err  string  `json:",omitempty"` // error message, if error
+}

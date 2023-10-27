@@ -839,40 +839,31 @@ func (c *WorkerClient) Test(ctx context.Context, w io.Writer, pkg string) error 
 
 	d := json.NewDecoder(res.Body)
 	for {
-		var line []any
-		if err := d.Decode(&line); err != nil {
+		var es tbtype.ExecStream
+		if err := d.Decode(&es); err != nil {
 			return err
 		}
-		if len(line) < 2 {
-			fmt.Fprintf(w, "got: %#v\n", line)
-			continue
-		}
-		typ, ok := line[0].(float64)
-		if !ok {
-			continue
-		}
-		str, ok := line[1].(string)
-		if !ok {
-			fmt.Fprintf(w, "got: %T %T\n", line[0], line[1])
-			continue
-		}
-		if typ == 2 { // stderr
-			s2 := strings.ReplaceAll(str, "go: downloading ", "📦 ")
-			if s2 != str {
-				io.WriteString(w, s2)
-				continue
-
+		if es.Exit != nil {
+			log.Printf("test of %v done after %v seconds: err=%q", pkg, es.Dur, es.Err)
+			if *es.Exit == 0 {
+				return nil
 			}
-			io.WriteString(w, "⚠️ "+str)
-			continue
+			return fmt.Errorf("test of %v failed: exit=%v, %v", pkg, *es.Exit, es.Err)
 		}
-		if typ == 1 { // stdout
-			io.WriteString(stdoutWrite, str)
-			continue
+		if es.O != "" {
+			es.OB = []byte(es.O)
 		}
-		fmt.Fprintf(w, "got: %v %q\n", line[0], line[1])
+		if es.E != "" {
+			es.E = strings.ReplaceAll(es.E, "go: downloading ", "📦 ")
+			es.EB = []byte(es.E)
+		}
+		if es.OB != nil {
+			stdoutWrite.Write(es.OB)
+		}
+		if es.EB != nil {
+			w.Write(es.EB)
+		}
 	}
-	return nil
 }
 
 type Run struct {

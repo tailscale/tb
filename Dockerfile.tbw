@@ -18,7 +18,7 @@ FROM debian:bookworm
 
 RUN apt-get update && apt-get install -y \
     ca-certificates git curl jq strace \
-    iptables nftables kmod
+    iptables nftables kmod iproute2
 
 COPY --from=build /out/tbw /tbw
 COPY --from=build /out/go-cacher /usr/local/bin/go-cacher
