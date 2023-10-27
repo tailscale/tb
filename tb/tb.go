@@ -182,10 +182,6 @@ var (
 // assumed to be suspect.
 func (c *Controller) Serve6PN(w http.ResponseWriter, r *http.Request) {
 	if r.Method == "GET" {
-		if r.URL.Path == "/archive" {
-			c.serveArchive(w, r)
-			return
-		}
 		if machineRand, ok := strings.CutPrefix(r.URL.Path, "/worker-alive/"); ok {
 			c := c.machineAliveChan(machineRand)
 			if c != nil {
@@ -223,8 +219,6 @@ func (c *Controller) ServeTSNet(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, "not found", http.StatusNotFound)
 		return
-	case "/archive":
-		c.serveArchive(w, r)
 	case "/du":
 		c.serveDU(w, r)
 	case "/run":
@@ -257,17 +251,6 @@ func (c *Controller) registerRun(r *Run) {
 	mak.Set(&c.runs, r.id, r)
 }
 
-func (c *Controller) runByLocalRef(ref string) *Run {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	for _, r := range c.runs {
-		if r.fetch.LocalRef == ref {
-			return r
-		}
-	}
-	return nil
-}
-
 // getMachine returns a future to an newly created machine.
 // It doesn't take a context because if the caller goes away, we still want to
 // wait for it to be created so we can either shut it down cleanly or give it out
@@ -278,7 +261,7 @@ func (c *Controller) getMachine(image string) *Lazy[*fly.Machine] {
 	c.registerMachineAliveChan(machineRand, aliveCh)
 
 	const minMemoryMBPerPerformanceCore = 2048
-	const numCPU = 2
+	const numCPU = 1
 
 	return GetLazy(func() (*fly.Machine, error) {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
@@ -372,10 +355,11 @@ func (c *Controller) serveRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	wantTask := -1
+	wantTask := -1 // means overview page; >=0 means view a task
 	if v, err := strconv.Atoi(r.FormValue("task")); err == nil {
 		wantTask = v
 	}
+	viewAll := wantTask == -1
 
 	run.mu.Lock()
 	defer run.mu.Unlock()
@@ -392,9 +376,14 @@ func (c *Controller) serveRun(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, "<p>done in %v: %v</p>", run.doneAt.Sub(run.createdAt), html.EscapeString(errMsg))
 	}
 
-	fmt.Fprintf(w, "<hr><pre>\n%s\n</pre><hr><h3>tasks</h3>", html.EscapeString(run.buf.String()))
+	if viewAll {
+		fmt.Fprintf(w, "<hr><pre>\n%s\n</pre><hr><h3>tasks</h3>", html.EscapeString(run.buf.String()))
+	}
 
 	for i, t := range run.req.Tasks {
+		if !viewAll && i != wantTask {
+			continue
+		}
 		fmt.Fprintf(w, "<p><b><a href='/run?id=%s&task=%d'>Task %s</a></b>", run.id, i, html.EscapeString(t.Name))
 		if ts, ok := run.tasks[t]; ok {
 			if !ts.endedAt.IsZero() {
@@ -480,57 +469,21 @@ var (
 	tempRefRx = regexp.MustCompile(`^tempref-handle-\d+-[0-9a-f]+$`)
 )
 
-func (c *Controller) serveArchive(w http.ResponseWriter, r *http.Request) {
+func (c *Controller) getArchive(hash, ref string) (mem.RO, error) {
+	var zero mem.RO
 	metricCounterArchives.Add(1)
-	hash := r.FormValue("hash")
 	if !hashRx.MatchString(hash) {
-		http.Error(w, "bad 'hash'; want 40 lowercase hex", http.StatusBadRequest)
-		return
+		return zero, errors.New("bad 'hash'; want 40 lowercase hex")
 	}
-	// We also require a local-ref and make sure its rev-parse matches the hash.
-	// The randomness in the local-ref (and that it times out) then also serves
-	// as a time-limited capability token that we give out, preventing untrusted
-	// workers from getting any hash they know about.
-	ref := r.FormValue("ref")
-	if !tempRefRx.MatchString(ref) {
-		http.Error(w, "bad 'ref'; want a tempref-handle from fetch", http.StatusBadRequest)
-		return
-	}
-
-	cmd := exec.Command("git", "rev-parse", ref)
-	cmd.Dir = c.gitDir
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		http.Error(w, fmt.Sprintf("git rev-parse: %v\n%s", err, out), http.StatusInternalServerError)
-		return
-	}
-	if strings.TrimSpace(string(out)) != hash {
-		http.Error(w, "ref handle doesn't match provided hash", http.StatusBadRequest)
-		return
-	}
-
-	// TODO(bradfitz): at this point, check a cache (memory is probably
-	// sufficient, LRU of a dozen tarballs) and see if we've already made this
-	// tarball.
-
-	run := c.runByLocalRef(ref)
-	if run == nil {
-		log.Printf("can't find run for local ref %q", ref)
-		http.Error(w, "can't find run by local ref", http.StatusBadRequest)
-		return
-	}
-	s := run.startSpan("archive-clone-shallow")
-
+	// TODO: add more spans; move getArchive to method on Run instead?
 	td, err := os.MkdirTemp("", "tbarchive-*")
 	if err != nil {
-		s.end(err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+		return zero, err
 	}
 	defer os.RemoveAll(td)
 
 	shallowClone := filepath.Join(td, "shallow")
-	cmd = exec.Command("git", "clone",
+	cmd := exec.Command("git", "clone",
 		"--depth=1",
 		"--single-branch",
 		"--branch="+ref,
@@ -538,25 +491,19 @@ func (c *Controller) serveArchive(w http.ResponseWriter, r *http.Request) {
 		shallowClone)
 	cmd.Dir = c.gitDir
 	if out, err := cmd.CombinedOutput(); err != nil {
-		s.end(err)
-		http.Error(w, fmt.Sprintf("git clone: %v\n%s", err, out), http.StatusInternalServerError)
-		return
+		return zero, fmt.Errorf("git clone: %w\n%s", err, out)
 	}
-	s.end(nil)
 
-	s = run.startSpan("archive-tar-send")
-
-	w.Header().Set("Content-Type", "application/gzip")
-	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s.tar.gz"`, hash))
+	var buf bytes.Buffer
 	cmd = exec.Command("tar", "-zcf", "-", ".")
 	cmd.Dir = shallowClone
-	cmd.Stdout = w
+	cmd.Stdout = &buf
 	var errBuf bytes.Buffer
 	cmd.Stderr = &errBuf
-	if err := s.end(cmd.Run()); err != nil {
-		http.Error(w, fmt.Sprintf("git archive: %v\n%s", err, errBuf.Bytes()), http.StatusInternalServerError)
-		return
+	if err := cmd.Run(); err != nil {
+		return zero, fmt.Errorf("git archive: %v\n%s", err, errBuf.Bytes())
 	}
+	return mem.B(buf.Bytes()), nil
 }
 
 func (c *Controller) serveStartBuild(w http.ResponseWriter, r *http.Request) {
@@ -633,7 +580,12 @@ func (c *Controller) serveStartBuild(w http.ResponseWriter, r *http.Request) {
 	}
 	run.fetch = fetchRes
 
-	// TODO(bradfitz): start building the tarball concurrently
+	run.filesTarball = GetLazy(func() (mem.RO, error) {
+		s := run.startSpan("generate-files-tar")
+		v, err := c.getArchive(fetchRes.Hash, fetchRes.LocalRef)
+		s.end(err)
+		return v, err
+	})
 
 	// Wait for the base image fetch to finish.
 	select {
@@ -701,29 +653,6 @@ func (c *WorkerClient) WaitUp(d time.Duration) error {
 	case <-timer.C:
 		return errors.New("timeout waiting for machine to come up")
 	}
-}
-
-func (c *WorkerClient) PushTreeFromURL(ctx context.Context, dir, tgzURL string) error {
-	ctx, cancel := context.WithTimeout(ctx, time.Minute)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, "POST",
-		"http://["+c.m.PrivateIP.String()+"]:8080/put?dir="+url.QueryEscape(dir),
-		strings.NewReader((url.Values{
-			"url": {tgzURL},
-		}).Encode()))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	res, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return err
-	}
-	defer res.Body.Close()
-	if res.StatusCode != 200 {
-		return fmt.Errorf("pushing tarball: %v", res.Status)
-	}
-	return nil
 }
 
 func (c *WorkerClient) PushTreeFromReader(ctx context.Context, dir string, r io.Reader) error {
@@ -883,6 +812,7 @@ type Run struct {
 	workerImage      string
 	toolchain        string
 	toolChainTarball *Lazy[mem.RO]
+	filesTarball     *Lazy[mem.RO]
 
 	mu              sync.Mutex
 	machinesStarted set.Set[*Lazy[*fly.Machine]]
@@ -1008,12 +938,15 @@ func (r *Run) getUsableMachine() (_ *WorkerClient, retErr error) {
 		return nil, fmt.Errorf("WorkerClient.WaitUp = %w", err)
 	}
 
-	tgzURL := fmt.Sprintf("http://[%s]:8080/archive?hash=%s&ref=%s",
-		os.Getenv("FLY_PRIVATE_IP"), r.fetch.Hash, url.QueryEscape(r.fetch.LocalRef))
-
 	var eg errgroup.Group
 	eg.Go(func() error {
-		if err := r.runSpan("push-work-tree", func() error { return wc.PushTreeFromURL(r.ctx, "code", tgzURL) }); err != nil {
+		if err := r.runSpan("push-files", func() error {
+			ro, err := r.filesTarball.Get(r.ctx)
+			if err != nil {
+				return err
+			}
+			return wc.PushTreeFromReader(r.ctx, "code", mem.NewReader(ro))
+		}); err != nil {
 			return fmt.Errorf("PushTreeFromURL = %w", err)
 		}
 		return nil
@@ -1148,13 +1081,14 @@ func (r *Run) runTask(wc *WorkerClient, task *tbtype.Task) (retErr error) {
 		v, err := wc.CheckGo(r.ctx)
 		s.end(err)
 		fmt.Fprintf(ts, "CheckGo = %q, %v\n", v, err)
+		return err
 	case "test":
 		// TODO(bradfitz): support more than one package per invocation;
 		// overhaul the Test method into a generic Exec method like Go's
 		// buildlet.
-		r.runSpan("task-"+task.Name, func() error { return wc.Test(r.ctx, ts, task.Packages[0]) })
+		return r.runSpan("task-"+task.Name, func() error { return wc.Test(r.ctx, ts, task.Packages[0]) })
 	}
-	return nil
+	return fmt.Errorf("unknown action %q", task.Action)
 }
 
 var (
