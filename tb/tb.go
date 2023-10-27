@@ -36,6 +36,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -231,8 +232,8 @@ func (c *Controller) ServeTSNet(w http.ResponseWriter, r *http.Request) {
 	case "/":
 		fmt.Fprintf(w, `<html><body><h1>Tailscale Build</h1>
 		[<a href='/du'>du</a>] [<a href="/debug">debug</a>]
-		<form method=POST action=/fetch>Fetch ref: <input name=ref><input type=submit value="fetch"></form>
-		<form method=POST action=/start-build>Test ref: <input name=ref> package(s)/all: <input name=pkg> <input type=submit value="start"></form>
+		<form method=POST action=/start-build>Test ref: <input name=ref>, <code>-j</code><input name=machines value=1 size=2>, package(s)/all: <input name=pkg> <input type=submit value="start"></form>
+		<form method=POST action=/fetch>[debug] Fetch ref: <input name=ref><input type=submit value="fetch"></form>
 		`)
 
 	}
@@ -275,6 +276,10 @@ func (c *Controller) getMachine(image string) *Lazy[*fly.Machine] {
 	machineRand := rands.HexString(16)
 	aliveCh := make(chan bool, 1)
 	c.registerMachineAliveChan(machineRand, aliveCh)
+
+	const minMemoryMBPerPerformanceCore = 2048
+	const numCPU = 2
+
 	return GetLazy(func() (*fly.Machine, error) {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 		defer cancel()
@@ -287,8 +292,8 @@ func (c *Controller) getMachine(image string) *Lazy[*fly.Machine] {
 					"REGISTER_ALIVE_URL": "http://[" + os.Getenv("FLY_PRIVATE_IP") + "]:8080/worker-alive/" + machineRand,
 				},
 				Guest: &fly.MachineGuest{
-					MemoryMB: 8192, // required 2048 per core for performance
-					CPUs:     4,
+					MemoryMB: numCPU * minMemoryMBPerPerformanceCore,
+					CPUs:     numCPU,
 					CPUKind:  "performance",
 				},
 				Image: image,
@@ -367,6 +372,11 @@ func (c *Controller) serveRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	wantTask := -1
+	if v, err := strconv.Atoi(r.FormValue("task")); err == nil {
+		wantTask = v
+	}
+
 	run.mu.Lock()
 	defer run.mu.Unlock()
 
@@ -382,7 +392,26 @@ func (c *Controller) serveRun(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, "<p>done in %v: %v</p>", run.doneAt.Sub(run.createdAt), html.EscapeString(errMsg))
 	}
 
-	fmt.Fprintf(w, "<hr><pre>\n%s\n</pre>", html.EscapeString(run.buf.String()))
+	fmt.Fprintf(w, "<hr><pre>\n%s\n</pre><hr><h3>tasks</h3>", html.EscapeString(run.buf.String()))
+
+	for i, t := range run.req.Tasks {
+		fmt.Fprintf(w, "<p><b><a href='/run?id=%s&task=%d'>Task %s</a></b>", run.id, i, html.EscapeString(t.Name))
+		if ts, ok := run.tasks[t]; ok {
+			if !ts.endedAt.IsZero() {
+				d := ts.endedAt.Sub(ts.startedAt)
+				fmt.Fprintf(w, ", after %v: %v", d, html.EscapeString(fmt.Sprint(ts.finalErr)))
+			} else {
+				fmt.Fprintf(w, ", running for %v", time.Since(ts.startedAt))
+			}
+			if i == wantTask {
+				fmt.Fprintf(w, "<pre>\n%s\n</pre>", html.EscapeString(ts.buf.String()))
+			}
+		} else {
+			fmt.Fprintf(w, ", not started")
+		}
+		fmt.Fprintf(w, "</p>")
+	}
+
 }
 
 func (c *Controller) serveJSON(w http.ResponseWriter, statusCode int, v any) {
@@ -540,6 +569,7 @@ func (c *Controller) serveStartBuild(w http.ResponseWriter, r *http.Request) {
 
 	var req tbtype.BuildRequest
 	if r.Header.Get("Content-Type") == "application/x-www-form-urlencoded" {
+		req.Machines, _ = strconv.Atoi(r.FormValue("machines"))
 		req.Ref = r.FormValue("ref")
 		pkg := r.FormValue("pkg")
 		switch pkg {
@@ -865,12 +895,30 @@ type Run struct {
 
 	mu              sync.Mutex
 	machinesStarted set.Set[*Lazy[*fly.Machine]]
+	tasks           map[*tbtype.Task]*TaskStatus
 	clients         set.Set[*WorkerClient]
 	doneAt          time.Time
 	err             error
 	buf             bytes.Buffer
 	spans           []*span
 	spansOpen       int
+}
+
+type TaskStatus struct {
+	r    *Run
+	task *tbtype.Task
+
+	// Mutable fields, guarded by r.mu:
+	startedAt time.Time
+	endedAt   time.Time
+	finalErr  error
+	buf       bytes.Buffer
+}
+
+func (ts *TaskStatus) Write(p []byte) (n int, err error) {
+	ts.r.mu.Lock()
+	defer ts.r.mu.Unlock()
+	return ts.buf.Write(p)
 }
 
 func (r *Run) Run() {
@@ -1028,26 +1076,93 @@ func (r *Run) run() error {
 		return v, err
 	})
 
-	wc, err := r.getUsableMachine()
-	if err != nil {
-		return err
+	freeMachines := make(chan *WorkerClient, 1000)
+	machineErr := make(chan error, 1)
+	for i := 0; i < r.req.Machines; i++ {
+		go func() {
+			wc, err := r.getUsableMachine()
+			if err != nil {
+				select {
+				case machineErr <- err:
+				default:
+				}
+				return
+			}
+			select {
+			case freeMachines <- wc:
+			case <-r.ctx.Done():
+			}
+		}()
 	}
 
-	for _, task := range r.req.Tasks {
-		switch task.Action {
-		case "check-go":
-			s := r.startSpan("check-go")
-			v, err := wc.CheckGo(r.ctx)
-			s.end(err)
-			fmt.Fprintf(r, "CheckGo = %q, %v\n", v, err)
-		case "test":
-			// TODO(bradfitz): support more than one package per invocation;
-			// overhaul the Test method into a generic Exec method like Go's
-			// buildlet.
-			r.runSpan("task-"+task.Name, func() error { return wc.Test(r.ctx, r, task.Packages[0]) })
+	doneTask := make(chan *tbtype.Task, 16)
+	remain := r.req.Tasks
+	done := 0
+	gotAnyMachine := false
+	for {
+		select {
+		case <-r.ctx.Done():
+			return r.ctx.Err()
+		case <-doneTask:
+			done++
+			if done == len(r.req.Tasks) {
+				return nil
+			}
+		case err := <-machineErr:
+			if !gotAnyMachine {
+				return err
+			}
+		case wc := <-freeMachines:
+			gotAnyMachine = true
+			if len(remain) == 0 {
+				// TODO: early return it so different run can use it?
+				break
+			}
+			task := remain[0]
+			remain = remain[1:]
+			go func() {
+				if err := r.runTask(wc, task); err != nil {
+					log.Printf("task %q: %v", task.Name, err)
+				}
+				select {
+				case doneTask <- task:
+					select {
+					case freeMachines <- wc:
+					case <-r.ctx.Done():
+					}
+				case <-r.ctx.Done():
+					return
+				}
+			}()
 		}
 	}
+}
 
+func (r *Run) runTask(wc *WorkerClient, task *tbtype.Task) (retErr error) {
+	ts := &TaskStatus{r: r, task: task, startedAt: time.Now()}
+	r.mu.Lock()
+	mak.Set(&r.tasks, task, ts)
+	r.mu.Unlock()
+
+	defer func() {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		ts.endedAt = time.Now()
+		ts.finalErr = retErr
+	}()
+
+	switch task.Action {
+	case "check-go":
+		s := r.startSpan("check-go")
+		v, err := wc.CheckGo(r.ctx)
+		s.end(err)
+		fmt.Fprintf(ts, "CheckGo = %q, %v\n", v, err)
+	case "test":
+		// TODO(bradfitz): support more than one package per invocation;
+		// overhaul the Test method into a generic Exec method like Go's
+		// buildlet.
+		r.runSpan("task-"+task.Name, func() error { return wc.Test(r.ctx, ts, task.Packages[0]) })
+	}
 	return nil
 }
 
