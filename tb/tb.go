@@ -687,52 +687,82 @@ type ExecOpt struct {
 var zeroOpt = new(ExecOpt)
 
 func (c *WorkerClient) CheckGo(ctx context.Context) (string, error) {
-	ctx, cancel := context.WithTimeout(ctx, 15*time.Minute)
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, "GET", "http://["+c.m.PrivateIP.String()+"]:8080/check/go-version?"+(url.Values{
-		"cache-server": {cacheServerAddr()},
-	}).Encode(), nil)
+	var stdout, stderr bytes.Buffer
+	err := c.Exec(ctx, &stdout, &stderr, &tbtype.ExecRequest{
+		Cmd:  "./tool/go",
+		Args: []string{"version"},
+	})
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("exec: %v, %s", err, stderr.Bytes())
+	}
+	return strings.TrimSpace(stdout.String()), err
+}
+
+// Exec executes req remotely.
+//
+// req.TimeoutSeconds doesn't need to be set. The context is also used.
+//
+// If stderr or stdout is nil, that output stream is ignored.
+func (c *WorkerClient) Exec(ctx context.Context, stdout, stderr io.Writer, param *tbtype.ExecRequest) error {
+	er := *param
+	if stdout == nil {
+		er.IgnoreStdout = true
+	}
+	if stderr == nil {
+		er.IgnoreStderr = true
+	}
+	j, err := json.Marshal(&er)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, "POST", "http://["+c.m.PrivateIP.String()+"]:8080/exec", bytes.NewReader(j))
+	if err != nil {
+		return err
 	}
 	res, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return "", err
+		return err
 	}
 	defer res.Body.Close()
 	if res.StatusCode != 200 {
-		return "", fmt.Errorf("pushing tarball: %v", res.Status)
+		return fmt.Errorf("exec %v %v: %v", er.Cmd, er.Args, res.Status)
 	}
-	all, err := io.ReadAll(res.Body)
-	return strings.TrimSpace(string(all)), err
+	d := json.NewDecoder(res.Body)
+	for {
+		var es tbtype.ExecStream
+		if err := d.Decode(&es); err != nil {
+			return err
+		}
+		if es.Exit != nil {
+			if *es.Exit == 0 {
+				return nil
+			}
+			return fmt.Errorf("exit status: %v, %v", *es.Exit, es.Err)
+		}
+		if es.O != "" {
+			es.OB = []byte(es.O)
+		}
+		if es.E != "" {
+			es.EB = []byte(es.E)
+		}
+		if es.OB != nil && stdout != nil {
+			stdout.Write(es.OB)
+		}
+		if es.EB != nil && stderr != nil {
+			stderr.Write(es.EB)
+		}
+	}
+
 }
 
 func (c *WorkerClient) Test(ctx context.Context, w io.Writer, pkg string) error {
 	pkg, run, _ := strings.Cut(pkg, "!") // TODO(bradfitz): temporary hack to smuggle run arg
-	ctx, cancel := context.WithTimeout(ctx, 15*time.Minute)
+	const timeout = 15 * time.Minute
+	ctx, cancel := context.WithTimeout(ctx, timeout+5*time.Second)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, "GET", "http://["+c.m.PrivateIP.String()+"]:8080/test?"+(url.Values{
-		"pkg":          {pkg},
-		"run":          {run},
-		"cache-server": {cacheServerAddr()},
-	}).Encode(), nil)
-	if err != nil {
-		return err
-	}
-	req.Header.Add("Test-Env", "GOPROXY=http://["+os.Getenv("FLY_PRIVATE_IP")+"]:8082")
 
-	res, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return err
-	}
-	defer res.Body.Close()
-	if res.StatusCode != 200 {
-		return fmt.Errorf("testing %v: %v", pkg, res.Status)
-	}
-
-	// TODO: wrap w with a version that has a mutex if it doesn't already
-
-	// stdout stream
 	stdoutRead, stdoutWrite := io.Pipe()
 	var eg errgroup.Group
 	eg.Go(func() error {
@@ -766,33 +796,16 @@ func (c *WorkerClient) Test(ctx context.Context, w io.Writer, pkg string) error 
 	}()
 	defer stdoutWrite.Close()
 
-	d := json.NewDecoder(res.Body)
-	for {
-		var es tbtype.ExecStream
-		if err := d.Decode(&es); err != nil {
-			return err
-		}
-		if es.Exit != nil {
-			log.Printf("test of %v done after %v seconds: err=%q", pkg, es.Dur, es.Err)
-			if *es.Exit == 0 {
-				return nil
-			}
-			return fmt.Errorf("test of %v failed: exit=%v, %v", pkg, *es.Exit, es.Err)
-		}
-		if es.O != "" {
-			es.OB = []byte(es.O)
-		}
-		if es.E != "" {
-			es.E = strings.ReplaceAll(es.E, "go: downloading ", "📦 ")
-			es.EB = []byte(es.E)
-		}
-		if es.OB != nil {
-			stdoutWrite.Write(es.OB)
-		}
-		if es.EB != nil {
-			w.Write(es.EB)
-		}
-	}
+	return c.Exec(ctx, stdoutWrite, w, &tbtype.ExecRequest{
+		Dir:  "",
+		Cmd:  "./tool/go",
+		Args: []string{"test", "-json", "-v", "-run=" + run, pkg},
+		Env: []string{
+			"GOPROXY=http://[" + os.Getenv("FLY_PRIVATE_IP") + "]:8082",
+			fmt.Sprintf("GOCACHEPROG=/usr/local/bin/go-cacher --verbose=%v --cache-server=%s --cache-dir=/home/workdir/.cache/go-cacher", false, cacheServerAddr()),
+		},
+		TimeoutSeconds: timeout.Seconds(),
+	})
 }
 
 type Run struct {

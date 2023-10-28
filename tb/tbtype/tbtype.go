@@ -52,6 +52,9 @@ type ExecRequest struct {
 	Args []string
 	Env  []string
 
+	IgnoreStdout bool
+	IgnoreStderr bool
+
 	MergeStderrIntoStdout bool
 	TimeoutSeconds        float64 // 0 means no timeout
 }
