@@ -29,6 +29,7 @@ import (
 	"fmt"
 	"html"
 	"io"
+	"io/fs"
 	"log"
 	"net/http"
 	"net/url"
@@ -101,10 +102,9 @@ func main() {
 		GoBinEnv: []string{
 			"GOPROXY=https://proxy.golang.org",
 		},
-		// TODO(bradfitz): wrap this Cacher in one with metrics
-		Cacher:              goproxy.DirCacher(goProxyCacheDir),
+		Cacher:              goProxyMetricTrackingCacher{goproxy.DirCacher(goProxyCacheDir)},
 		CacherMaxCacheBytes: 20 << 30,
-		Transport:           http.DefaultTransport,
+		Transport:           goProxyMetricTrackingRoundTripper{http.DefaultTransport},
 		ErrorLogger:         log.Default(),
 	}
 
@@ -1182,4 +1182,72 @@ func (lv *Lazy[T]) Get(ctx context.Context) (T, error) {
 		var zero T
 		return zero, ctx.Err()
 	}
+}
+
+var (
+	metricGoProxyCacheHit      = expvar.NewInt("counter_goproxy_cache_hit")
+	metricGoProxyCacheHitBytes = expvar.NewInt("counter_goproxy_cache_hit_bytes")
+	metricGoProxyCacheMiss     = expvar.NewInt("counter_goproxy_cache_miss")
+	metricGoProxyCacheErr      = expvar.NewInt("counter_goproxy_cache_err")
+
+	metricGoProxyFetchCount = expvar.NewInt("counter_goproxy_fetch_count")
+	metricGoProxyFetchBytes = expvar.NewInt("counter_goproxy_fetch_bytes")
+	metricGoProxyFetchErr   = expvar.NewInt("counter_goproxy_fetch_err")
+
+	metricGoProxyPutSuccess = expvar.NewInt("counter_goproxy_put_success")
+	metricGoProxyPutErr     = expvar.NewInt("counter_goproxy_put_err")
+)
+
+var _ goproxy.Cacher = goProxyMetricTrackingCacher{}
+
+type goProxyMetricTrackingCacher struct {
+	c goproxy.Cacher
+}
+
+func (c goProxyMetricTrackingCacher) Get(ctx context.Context, name string) (io.ReadCloser, error) {
+	v, err := c.c.Get(ctx, name)
+	switch {
+	case err == nil:
+		metricGoProxyCacheHit.Add(1)
+		if fi, ok := v.(interface{ Size() int64 }); ok { // DirCache embeds an os.FileInfo in its ReadCloser type
+			metricGoProxyCacheHitBytes.Add(fi.Size())
+		}
+	case errors.Is(err, fs.ErrNotExist):
+		metricGoProxyCacheMiss.Add(1)
+	default:
+		metricGoProxyCacheErr.Add(1)
+	}
+	return v, err
+}
+
+// Put puts a cache for the name with the content.
+func (c goProxyMetricTrackingCacher) Put(ctx context.Context, name string, content io.ReadSeeker) error {
+	err := c.c.Put(ctx, name, content)
+	if err != nil {
+		metricGoProxyPutErr.Add(1)
+		return err
+	}
+	metricGoProxyPutSuccess.Add(1)
+	return nil
+}
+
+type goProxyMetricTrackingRoundTripper struct {
+	rt http.RoundTripper
+}
+
+func (rt goProxyMetricTrackingRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	res, err := rt.rt.RoundTrip(req)
+	if err != nil {
+		metricGoProxyFetchErr.Add(1)
+		return nil, err
+	}
+	if res.StatusCode == 200 {
+		metricGoProxyFetchCount.Add(1)
+		if res.ContentLength > 0 {
+			metricGoProxyFetchBytes.Add(res.ContentLength)
+		}
+	} else {
+		metricGoProxyFetchErr.Add(1)
+	}
+	return res, nil
 }
