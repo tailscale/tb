@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/netip"
@@ -84,6 +85,39 @@ type CreateMachineRequest struct {
 	Region                  string         `json:"region,omitempty"`
 	SkipLaunch              bool           `json:"skip_launch,omitempty"`
 	SkipServiceRegistration bool           `json:"skip_service_registration,omitempty"`
+}
+
+type CreateVolumeRequest struct {
+	Compute           *MachineGuest `json:"compute,omitempty"`
+	Encrypted         bool          `json:"encrypted,omitempty"`
+	FSType            string        `json:"fstype,omitempty"`
+	MachinesOnly      bool          `json:"machines_only,omitempty"`
+	Name              string        `json:"name,omitempty"` // not a primary key; can be used by multiple at once
+	Region            string        `json:"region,omitempty"`
+	RequireUniqueZone bool          `json:"require_unique_zone,omitempty"`
+	SizeGB            int           `json:"size_gb,omitempty"`
+	SnapshotID        string        `json:"snapshot_id,omitempty"`
+	SnapshotRetention int           `json:"snapshot_retention,omitempty"`
+	SourceVolumeID    string        `json:"source_volume_id,omitempty"`
+}
+
+type Volume struct {
+	AttachedAllocID   string     `json:"attached_alloc_id,omitempty"`
+	AttachedMachineID string     `json:"attached_machine_id,omitempty"`
+	BlockSize         int        `json:"block_size,omitempty"`
+	Blocks            int        `json:"blocks,omitempty"`
+	BlocksAvail       int        `json:"blocks_avail,omitempty"`
+	BlocksFree        int        `json:"blocks_free,omitempty"`
+	CreatedAt         *time.Time `json:"created_at,omitempty"` // string technically?
+	Encrypted         bool       `json:"encrypted,omitempty"`
+	FSType            string     `json:"fstype,omitempty"`
+	ID                string     `json:"id,omitempty"`
+	Name              string     `json:"name,omitempty"` // not a primary key; can be used by multiple at once
+	Region            string     `json:"region,omitempty"`
+	SizeGB            int        `json:"size_gb,omitempty"`
+	SnapshotRetention int        `json:"snapshot_retention,omitempty"`
+	State             string     `json:"state,omitempty"`
+	Zone              string     `json:"zone,omitempty"`
 }
 
 func (c *Client) CreateMachine(ctx context.Context, r *CreateMachineRequest) (*Machine, error) {
@@ -189,4 +223,36 @@ func (c *Client) toMachineID(ctx context.Context, method string, id MachineID, s
 		return errors.New(res.Status)
 	}
 	return nil
+}
+
+func (c *Client) CreateVolume(ctx context.Context, r *CreateVolumeRequest) (*Volume, error) {
+	j, err := json.Marshal(r)
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, "POST", c.base()+"/v1/apps/"+c.App+"/volumes", bytes.NewReader(j))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+c.Token)
+	res, err := c.httpc().Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer res.Body.Close()
+	if res.StatusCode != 200 {
+		body, _ := io.ReadAll(res.Body)
+		var resj struct {
+			Error string
+		}
+		if err := json.Unmarshal(body, &resj); err == nil {
+			return nil, errors.New(resj.Error)
+		}
+		return nil, fmt.Errorf("%s: %s", res.Status, body)
+	}
+	m := new(Volume)
+	if err := json.NewDecoder(res.Body).Decode(m); err != nil {
+		return nil, err
+	}
+	return m, nil
 }

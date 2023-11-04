@@ -62,6 +62,21 @@ func main() {
 	}
 	ctx := context.Background()
 
+	if os.Getenv("VOLTEST") == "1" {
+		v, err := c.CreateVolume(ctx, &fly.CreateVolumeRequest{
+			Name:              "tbw_vol01",
+			SizeGB:            10,
+			Region:            "phx",
+			RequireUniqueZone: true,
+		})
+		if err != nil {
+			log.Fatal(err)
+		}
+		log.Printf("Made a volume: %v", logger.AsJSON(v))
+		// {"created_at":"2023-11-04T16:19:03.89Z","encrypted":true,"id":"vol_nvxywlzzl7l72884","name":"tbw_vol01","region":"phx","size_gb":10,"snapshot_retention":5,"state":"created","zone":"4514"}
+		return
+	}
+
 	if *create {
 		m, err := c.CreateMachine(ctx, &fly.CreateMachineRequest{
 			Region: "sea",
