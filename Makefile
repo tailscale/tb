@@ -7,6 +7,9 @@ usage:
 push-tb:
 	@flyctl deploy -c tb/fly.toml --vm-size=performance-2x .
 
+push-tbcs:
+	@flyctl deploy -c tbcs/fly.toml --vm-size=performance-1x .
+
 # nuke-tbw-base:
 # 	@flyctl machine list -a tb-no-secrets --json  | jq -r '.[] | select(.name == "base") | .id' | xargs fly machine -a tb-no-secrets destroy -f 
 

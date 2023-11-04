@@ -1,0 +1,8 @@
+app = "tbcs"
+primary_region = "sea"
+
+[build]
+  dockerfile = "../Dockerfile.tbcs"
+
+[deploy]
+  strategy = "immediate"

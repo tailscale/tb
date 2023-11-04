@@ -1,0 +1,20 @@
+# Build
+FROM golang:1.21 AS build
+
+WORKDIR /go/src/tb
+
+COPY go.mod go.sum .
+RUN go mod download
+
+COPY . .
+RUN mkdir -p /out
+RUN go build -o /out/tbcs ./tbcs
+
+# Deploy
+FROM debian:bookworm
+
+RUN apt-get update && apt-get install -y \
+    ca-certificates git curl jq strace
+
+COPY --from=build /out/tbcs /tbcs
+CMD ["/tbcs"]

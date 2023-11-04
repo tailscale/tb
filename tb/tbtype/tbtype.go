@@ -70,3 +70,5 @@ type ExecStream struct {
 	Dur  float64 `json:",omitempty"` // seconds it took to run, at exit
 	Err  string  `json:",omitempty"` // error message, if error
 }
+
+const CmdNetMesh = "builtin:netmesh"

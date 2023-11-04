@@ -19,10 +19,12 @@ import (
 	"archive/tar"
 	"compress/gzip"
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"log"
 	"net/http"
 	"net/url"
@@ -31,12 +33,15 @@ import (
 	"path"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
 	"github.com/tailscale/tb/tb/tbtype"
+	"golang.org/x/sync/errgroup"
 	"tailscale.com/types/ptr"
 )
 
@@ -104,6 +109,18 @@ func main() {
 	}))
 	m.HandleFunc("/gen204", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
+	}))
+	m.HandleFunc("/rand", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n, _ := strconv.Atoi(r.FormValue("n"))
+		if n == 0 {
+			n = 1
+		}
+		w.Header().Set("Content-Type", "application/octet-stream")
+		copied, err := io.CopyN(w, rand.Reader, int64(n))
+		if copied != int64(n) {
+			log.Printf("short copy of rand data: %v (not %v), %v", copied, n, err)
+		}
+		return
 	}))
 	m.HandleFunc("/quitquitquit", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != "POST" {
@@ -190,29 +207,35 @@ func serveExec(w http.ResponseWriter, r *http.Request) {
 		defer cancel()
 	}
 
-	cmdPath := req.Cmd
-	if strings.HasPrefix(req.Cmd, "./") {
-		cmdPath = filepath.Join(codeDir, req.Cmd)
-	}
-
-	cmd := exec.CommandContext(ctx, cmdPath, req.Args...)
-	cmd.Dir = cmd.Dir
-	if cmd.Dir == "" {
-		cmd.Dir = codeDir
-	}
-
 	var mu sync.Mutex
+	var err error
+
 	je := json.NewEncoder(w)
 	f := w.(http.Flusher)
-
-	cmd.Dir = codeDir
-	cmd.Stdout = &webWriter{1, &mu, je, f}
-	cmd.Stderr = &webWriter{2, &mu, je, f}
-	cmd.Env = append(os.Environ(), "HOME="+workDir)
-	cmd.Env = append(cmd.Env, req.Env...)
+	stdoutWriter := &webWriter{1, &mu, je, f}
+	stderrWriter := &webWriter{2, &mu, je, f}
 
 	t0 := time.Now()
-	err := cmd.Run()
+	cmdPath := req.Cmd
+	switch cmdPath {
+	case tbtype.CmdNetMesh:
+		err = serveExecNetMesh(ctx, &req, stdoutWriter, stderrWriter)
+	default:
+		if strings.HasPrefix(req.Cmd, "./") {
+			cmdPath = filepath.Join(codeDir, req.Cmd)
+		}
+		cmd := exec.CommandContext(ctx, cmdPath, req.Args...)
+		cmd.Dir = cmd.Dir
+		if cmd.Dir == "" {
+			cmd.Dir = codeDir
+		}
+		cmd.Dir = codeDir
+		cmd.Stdout = stdoutWriter
+		cmd.Stderr = stderrWriter
+		cmd.Env = append(os.Environ(), "HOME="+workDir)
+		cmd.Env = append(cmd.Env, req.Env...)
+		err = cmd.Run()
+	}
 	d := time.Since(t0).Round(time.Millisecond)
 
 	final := &tbtype.ExecStream{
@@ -237,6 +260,40 @@ func serveExec(w http.ResponseWriter, r *http.Request) {
 func env(w http.ResponseWriter, r *http.Request) {
 	j, _ := json.MarshalIndent(os.Environ(), "", "  ")
 	w.Write(j)
+}
+
+func serveExecNetMesh(ctx context.Context, er *tbtype.ExecRequest, stdout, stderr io.Writer) error {
+	var eg errgroup.Group
+	var sum atomic.Int64
+	var reqs atomic.Int64
+	for _, u := range er.Args {
+		if !strings.HasPrefix(u, "http") {
+			continue
+		}
+		u := u
+		eg.Go(func() error {
+			req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
+			if err != nil {
+				return err
+			}
+			res, err := http.DefaultClient.Do(req)
+			if err != nil {
+				return err
+			}
+			defer res.Body.Close()
+			if res.StatusCode != 200 {
+				return errors.New(res.Status)
+			}
+			n, err := io.Copy(ioutil.Discard, res.Body)
+			sum.Add(n)
+			reqs.Add(1)
+			return err
+		})
+	}
+
+	err := eg.Wait()
+	fmt.Fprintf(stderr, "# copied %v (over %v reqs), err=%v\n", sum.Load(), reqs.Load(), err)
+	return err
 }
 
 func handlePutTarball(w http.ResponseWriter, r *http.Request) {

@@ -37,6 +37,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -267,7 +268,7 @@ func (c *Controller) getMachine(image string) *Lazy[*fly.Machine] {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 		defer cancel()
 		return c.fc.CreateMachine(ctx, &fly.CreateMachineRequest{
-			Region: "sea",
+			Region: "phx",
 			Config: &fly.MachineConfig{
 				AutoDestroy: true,
 				Env: map[string]string{
@@ -517,6 +518,9 @@ func (c *Controller) serveStartBuild(w http.ResponseWriter, r *http.Request) {
 	var req tbtype.BuildRequest
 	if r.Header.Get("Content-Type") == "application/x-www-form-urlencoded" {
 		req.Machines, _ = strconv.Atoi(r.FormValue("machines"))
+		if req.Machines == 0 {
+			req.Machines = 1
+		}
 		req.Ref = r.FormValue("ref")
 		pkg := r.FormValue("pkg")
 		switch pkg {
@@ -524,6 +528,11 @@ func (c *Controller) serveStartBuild(w http.ResponseWriter, r *http.Request) {
 			req.Tasks = []*tbtype.Task{
 				{Name: "lru", GOOS: "linux", GOARCH: "amd64", Action: "test", Packages: []string{"tailscale.com/util/lru"}},
 				{Name: "lru", GOOS: "linux", GOARCH: "amd64", Action: "test", Packages: []string{"tailscale.com/util/cmpx"}},
+			}
+		case "!netmesh":
+			// Make a set of 1 Task that matches what the doingNetMeshTest method looks for.
+			req.Tasks = []*tbtype.Task{
+				{Name: "netmesh", Action: "netmesh"},
 			}
 		default:
 			pkgs := strings.Fields(pkg)
@@ -542,10 +551,11 @@ func (c *Controller) serveStartBuild(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	const maxMachines = 300
 	if req.Machines == 0 {
 		req.Machines = 1
-	} else if req.Machines > 100 {
-		req.Machines = 100
+	} else if req.Machines > maxMachines {
+		req.Machines = maxMachines
 	}
 
 	// TODO(bradfitz): finish plumbing/using this goCache stuff
@@ -925,6 +935,10 @@ func (s *span) end(err error) error {
 	return err
 }
 
+func (r *Run) doingNetMeshTest() bool {
+	return len(r.req.Tasks) == 1 && r.req.Tasks[0].Action == "netmesh"
+}
+
 func (r *Run) getUsableMachine() (_ *WorkerClient, retErr error) {
 	r.mu.Lock()
 	n := len(r.machinesStarted) + 1
@@ -947,8 +961,12 @@ func (r *Run) getUsableMachine() (_ *WorkerClient, retErr error) {
 
 	wc := &WorkerClient{m: m, c: r.c, hash: r.fetch.Hash}
 	spanReach := r.startSpan(fmt.Sprintf("wait-reachable-%d", n))
-	if err := spanReach.end(wc.WaitUp(15 * time.Second)); err != nil {
+	if err := spanReach.end(wc.WaitUp(30 * time.Second)); err != nil {
 		return nil, fmt.Errorf("WorkerClient.WaitUp = %w", err)
+	}
+
+	if r.doingNetMeshTest() {
+		return wc, nil
 	}
 
 	var eg errgroup.Group
@@ -998,6 +1016,10 @@ func (r *Run) cleanup() {
 
 func (r *Run) run() error {
 	defer r.cleanup()
+
+	if r.doingNetMeshTest() {
+		return r.runNetMeshTest()
+	}
 
 	cmd := exec.Command("git", "show", r.fetch.Hash+":go.toolchain.rev")
 	cmd.Dir = r.c.gitDir
@@ -1073,6 +1095,79 @@ func (r *Run) run() error {
 			}()
 		}
 	}
+}
+
+func (r *Run) runNetMeshTest() error {
+	s := r.startSpan("get-all-machines")
+	mm := make([]*WorkerClient, r.req.Machines)
+	var eg errgroup.Group
+	for i := 0; i < r.req.Machines; i++ {
+		i := i
+		eg.Go(func() (err error) {
+			mm[i], err = r.getUsableMachine()
+			return
+		})
+	}
+	if err := s.end(eg.Wait()); err != nil {
+		return err
+	}
+
+	if r.req.Machines <= 1 {
+		return nil
+	}
+
+	s = r.startSpan("netmesh-all")
+	var eg2 errgroup.Group
+	style := "pairs-sort" // "mesh"
+	switch style {
+	case "pairs-sort":
+		sort.Slice(mm, func(i, j int) bool {
+			return mm[i].m.PrivateIP.Compare(*mm[j].m.PrivateIP) < 0
+		})
+		fallthrough
+	case "pairs":
+		size := (1 << 30) * len(mm) / (len(mm) / 2)
+		for i, wc := range mm {
+			if i%2 == 0 {
+				continue
+			}
+			var args []string
+			args = append(args, fmt.Sprintf("http://[%s]:8080/rand?n=%v", mm[i-1].m.PrivateIP, size))
+			wc := wc
+			s := r.startSpan(fmt.Sprintf("run-netmesh-%v", i))
+			eg2.Go(func() error {
+				return s.end(wc.Exec(r.ctx, r, r, &tbtype.ExecRequest{
+					Cmd:                   tbtype.CmdNetMesh,
+					Args:                  args,
+					MergeStderrIntoStdout: true,
+					TimeoutSeconds:        60 * 10,
+				}))
+			})
+		}
+
+	case "mesh":
+		size := (300 << 20) / (r.req.Machines - 1)
+		for i, wc := range mm {
+			args := make([]string, 0, len(mm)-1)
+			for _, wc2 := range mm {
+				if wc == wc2 {
+					continue
+				}
+				args = append(args, fmt.Sprintf("http://[%s]:8080/rand?n=%v", wc2.m.PrivateIP, size))
+			}
+			wc := wc
+			s := r.startSpan(fmt.Sprintf("run-netmesh-%v", i))
+			eg2.Go(func() error {
+				return s.end(wc.Exec(r.ctx, r, r, &tbtype.ExecRequest{
+					Cmd:                   tbtype.CmdNetMesh,
+					Args:                  args,
+					MergeStderrIntoStdout: true,
+					TimeoutSeconds:        60 * 10,
+				}))
+			})
+		}
+	}
+	return s.end(eg2.Wait())
 }
 
 func (r *Run) runTask(wc *WorkerClient, task *tbtype.Task) (retErr error) {
