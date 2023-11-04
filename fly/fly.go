@@ -10,8 +10,6 @@ import (
 	"io"
 	"net/http"
 	"net/netip"
-	"os"
-	"reflect"
 	"time"
 
 	"tailscale.com/util/cmpx"
@@ -121,48 +119,15 @@ type Volume struct {
 }
 
 func (c *Client) CreateMachine(ctx context.Context, r *CreateMachineRequest) (*Machine, error) {
-	j, err := json.Marshal(r)
-	if err != nil {
-		return nil, err
-	}
-	req, err := http.NewRequestWithContext(ctx, "POST", c.base()+"/v1/apps/"+c.App+"/machines", bytes.NewReader(j))
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Authorization", "Bearer "+c.Token)
-	res, err := c.httpc().Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer res.Body.Close()
-	if res.StatusCode != 200 {
-		res.Write(os.Stderr)
-		return nil, errors.New(res.Status)
-	}
-	m := new(Machine)
-	if err := json.NewDecoder(res.Body).Decode(m); err != nil {
-		return nil, err
-	}
-	return m, nil
+	return doFlyRequest[*Machine](ctx, c, "POST", "/v1/apps/"+c.App+"/machines", jsonBody(r))
 }
 
 func (c *Client) ListMachines(ctx context.Context) ([]*Machine, error) {
-	req, err := http.NewRequestWithContext(ctx, "GET", c.base()+"/v1/apps/"+c.App+"/machines", nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Authorization", "Bearer "+c.Token)
-	res, err := c.httpc().Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer res.Body.Close()
-	if res.StatusCode != 200 {
-		return nil, errors.New(res.Status)
-	}
-	var ret []*Machine
-	err = json.NewDecoder(res.Body).Decode(&ret)
-	return ret, err
+	return doFlyRequest[[]*Machine](ctx, c, "GET", c.path("machines"), nil)
+}
+
+func (c *Client) ListVolumes(ctx context.Context) ([]*Volume, error) {
+	return doFlyRequest[[]*Volume](ctx, c, "GET", c.path("volumes"), nil)
 }
 
 type StopParam struct {
@@ -171,7 +136,7 @@ type StopParam struct {
 }
 
 func (c *Client) StopMachine(ctx context.Context, id MachineID, optParam *StopParam) error {
-	var body any
+	var getBody func() (io.ReadCloser, error)
 	if p := optParam; p != nil {
 		var s struct {
 			Signal  string `json:"signal,omitempty"`
@@ -181,9 +146,9 @@ func (c *Client) StopMachine(ctx context.Context, id MachineID, optParam *StopPa
 		if p.Timeout != 0 {
 			s.Timeout = p.Timeout.String()
 		}
-		body = s
+		getBody = jsonBody(&s)
 	}
-	return c.toMachineID(ctx, "POST", id, "/stop", body)
+	return c.toMachineID(ctx, "POST", id, "/stop", getBody)
 }
 
 func (c *Client) StartMachine(ctx context.Context, id MachineID) error {
@@ -195,49 +160,38 @@ func (c *Client) DeleteMachine(ctx context.Context, id MachineID) error {
 	return c.toMachineID(ctx, "DELETE", id, "?force=true", nil)
 }
 
-func isNilPtr(v any) bool {
-	rv := reflect.ValueOf(v)
-	return rv.Kind() == reflect.Pointer && rv.IsZero()
-}
-
-func (c *Client) toMachineID(ctx context.Context, method string, id MachineID, suffix string, optBody any) error {
-	var body io.Reader
-	if optBody != nil && !isNilPtr(optBody) {
-		j, err := json.Marshal(optBody)
-		if err != nil {
-			return err
-		}
-		body = bytes.NewReader(j)
-	}
-	req, err := http.NewRequestWithContext(ctx, method, c.base()+"/v1/apps/"+c.App+"/machines/"+string(id)+suffix, body)
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Authorization", "Bearer "+c.Token)
-	res, err := c.httpc().Do(req)
-	if err != nil {
-		return err
-	}
-	defer res.Body.Close()
-	if res.StatusCode != 200 {
-		return errors.New(res.Status)
-	}
-	return nil
+func (c *Client) toMachineID(ctx context.Context, method string, id MachineID, suffix string, getBody func() (io.ReadCloser, error)) error {
+	_, err := doFlyRequest[any](ctx, c, method, "/v1/apps/"+c.App+"/machines/"+string(id)+suffix, getBody)
+	return err
 }
 
 func (c *Client) CreateVolume(ctx context.Context, r *CreateVolumeRequest) (*Volume, error) {
-	j, err := json.Marshal(r)
+	return doFlyRequest[*Volume](ctx, c, "POST", "/v1/apps/"+c.App+"/volumes", jsonBody(r))
+}
+
+func (c *Client) DeleteVolume(ctx context.Context, volumeID string) error {
+	_, err := doFlyRequest[any](ctx, c, "DELETE", "/v1/apps/"+c.App+"/volumes/"+volumeID, nil)
+	return err
+
+}
+
+func doFlyRequest[Res any](ctx context.Context, c *Client, method, path string, getBody func() (io.ReadCloser, error)) (Res, error) {
+	var zero Res
+	hreq, err := http.NewRequestWithContext(ctx, method, c.base()+path, nil)
 	if err != nil {
-		return nil, err
+		return zero, err
 	}
-	req, err := http.NewRequestWithContext(ctx, "POST", c.base()+"/v1/apps/"+c.App+"/volumes", bytes.NewReader(j))
-	if err != nil {
-		return nil, err
+	if getBody != nil {
+		hreq.GetBody = getBody
+		hreq.Body, err = getBody()
+		if err != nil {
+			return zero, err
+		}
 	}
-	req.Header.Set("Authorization", "Bearer "+c.Token)
-	res, err := c.httpc().Do(req)
+	hreq.Header.Set("Authorization", "Bearer "+c.Token)
+	res, err := c.httpc().Do(hreq)
 	if err != nil {
-		return nil, err
+		return zero, err
 	}
 	defer res.Body.Close()
 	if res.StatusCode != 200 {
@@ -246,13 +200,25 @@ func (c *Client) CreateVolume(ctx context.Context, r *CreateVolumeRequest) (*Vol
 			Error string
 		}
 		if err := json.Unmarshal(body, &resj); err == nil {
-			return nil, errors.New(resj.Error)
+			return zero, errors.New(resj.Error)
 		}
-		return nil, fmt.Errorf("%s: %s", res.Status, body)
+		return zero, fmt.Errorf("%s: %s", res.Status, body)
 	}
-	m := new(Volume)
-	if err := json.NewDecoder(res.Body).Decode(m); err != nil {
-		return nil, err
+	var ret Res
+	err = json.NewDecoder(res.Body).Decode(&ret)
+	return ret, err
+}
+
+func (c *Client) path(suffix string) string {
+	return "/v1/apps/" + c.App + "/" + suffix
+}
+
+func jsonBody(s any) (getBody func() (io.ReadCloser, error)) {
+	return func() (io.ReadCloser, error) {
+		j, err := json.Marshal(s)
+		if err != nil {
+			return nil, err
+		}
+		return io.NopCloser(bytes.NewReader(j)), nil
 	}
-	return m, nil
 }

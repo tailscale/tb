@@ -268,7 +268,7 @@ func (c *Controller) getMachine(image string) *Lazy[*fly.Machine] {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 		defer cancel()
 		return c.fc.CreateMachine(ctx, &fly.CreateMachineRequest{
-			Region: "phx",
+			Region: os.Getenv("FLY_REGION"),
 			Config: &fly.MachineConfig{
 				AutoDestroy: true,
 				Env: map[string]string{

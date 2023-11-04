@@ -66,13 +66,18 @@ func main() {
 		v, err := c.CreateVolume(ctx, &fly.CreateVolumeRequest{
 			Name:              "tbw_vol01",
 			SizeGB:            10,
-			Region:            "phx",
+			Region:            "sea",
 			RequireUniqueZone: true,
 		})
 		if err != nil {
 			log.Fatal(err)
 		}
 		log.Printf("Made a volume: %v", logger.AsJSON(v))
+
+		if err := c.DeleteVolume(ctx, v.ID); err != nil {
+			log.Fatalf("DeleteVolume: %v", err)
+		}
+		log.Printf("and deleted it.")
 		// {"created_at":"2023-11-04T16:19:03.89Z","encrypted":true,"id":"vol_nvxywlzzl7l72884","name":"tbw_vol01","region":"phx","size_gb":10,"snapshot_retention":5,"state":"created","zone":"4514"}
 		return
 	}
