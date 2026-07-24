@@ -1,5 +1,5 @@
 module github.com/tailscale/tb
-go 1.25.0
+go 1.26.0
 
 require (
 	github.com/bradfitz/parentdeath v0.0.0-20260315043412-764506aeb900
