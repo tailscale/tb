@@ -1,8 +1,0 @@
-app = "tb-no-secrets"
-primary_region = "sea"
-
-[build]
-  dockerfile = "Dockerfile.tbw"
-
-[deploy]
-  strategy = "immediate"
