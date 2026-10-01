@@ -2,7 +2,6 @@ package gocached
 
 import (
 	"context"
-	"slices"
 	"sync"
 	"time"
 )
@@ -11,80 +10,96 @@ import (
 const (
 	// defaultMinPutMovers and defaultMaxPutMovers bound the adaptive number
 	// of concurrent spooled-blob copies into the main blob directory. The
-	// minimum is the floor the governor never backs off below (and the
-	// starting point); the maximum bounds goroutines, open files, and the
-	// concurrency inflicted on the main directory's filesystem.
+	// minimum is the starting point and the floor the governor never trims
+	// below; the maximum bounds goroutines, open files, and the concurrency
+	// inflicted on the main directory's filesystem.
 	defaultMinPutMovers = 8
 	defaultMaxPutMovers = 256
 
-	// moverProbeMaxSize is the largest stored blob size whose copy latency
-	// counts as a probe of the main directory's round-trip latency. Below
-	// this the transfer time is negligible next to the fixed per-copy
-	// round trips (intent create, temp create, write, rename), so the
-	// latency reflects how loaded the filesystem is rather than how big
-	// the blob was. In practice most spooled blobs are this small.
-	moverProbeMaxSize = 64 << 10
+	// moverStepFraction is how far a probe moves the limit from the
+	// committed operating point, as a fraction of it (at least one slot).
+	moverStepFraction = 0.25
 
-	// moverAdjustInterval is how often the governor re-evaluates the limit.
-	moverAdjustInterval = 2 * time.Second
+	// moverEvalInterval is the shortest measurement window. A window also
+	// needs moverMinCompletions copies before the governor acts on it, and
+	// stretches up to moverMaxEvalInterval to collect them; a window that
+	// ends without them is discarded. 512 completions put the Poisson
+	// standard error of the window's rate near 4.4%, and of a comparison
+	// between two windows near 6.3%, under the 12.5% gain a probe must
+	// show, so a single noisy window rarely flips a decision.
+	moverEvalInterval    = 2 * time.Second
+	moverMaxEvalInterval = 30 * time.Second
+	moverMinCompletions  = 512
 
-	// moverMinProbes is the fewest probe samples an interval needs before
-	// the governor acts on it; with fewer it holds the current limit.
-	moverMinProbes = 5
+	// moverMinUtilization is the fraction of limit*window for which copy
+	// slots must have been held for the window to say anything about
+	// capacity. Below it, throughput was bounded by demand (an emptying
+	// backlog), not by the limit, and the window is discarded.
+	moverMinUtilization = 0.9
 
-	// moverIncreaseBelow and moverDecreaseAbove are the ratios of the
-	// interval's median probe latency to the unloaded baseline that
-	// trigger growth (when there is also demand) and shrinkage. Between
-	// them the limit holds.
-	moverIncreaseBelow = 1.5
-	moverDecreaseAbove = 2.0
+	// moverGainFraction is the share of the ideal (linear) throughput gain
+	// an upward probe must deliver to be kept: a +25% step must yield at
+	// least +12.5% copies/s. Latency rising with concurrency is expected
+	// and irrelevant; what matters is whether the extra slots did work.
+	moverGainFraction = 0.5
 
-	// moverIncreaseDivisor sets additive growth: the limit grows by
-	// limit/moverIncreaseDivisor (at least 1) per interval, so it doubles
-	// in about moverIncreaseDivisor intervals under sustained headroom.
-	moverIncreaseDivisor = 4
+	// moverLossTolerance is how much throughput a downward probe may lose
+	// and still be kept, meaning the slots given up were buying nothing
+	// beyond measurement noise.
+	moverLossTolerance = 0.1
 
-	// moverDecreaseNumer/Denom set multiplicative backoff: the limit is
-	// scaled by moverDecreaseNumer/moverDecreaseDenom when latency shows
-	// the filesystem is saturating.
-	moverDecreaseNumer = 3
-	moverDecreaseDenom = 4
+	// moverDropFraction is the fall in throughput at the committed limit
+	// that triggers an immediate downward probe: the directory got slower,
+	// so the committed concurrency may now be excess.
+	moverDropFraction = 0.25
 
-	// moverBaselineDrift is how much of the gap between the baseline and an
-	// unloaded interval's median the baseline absorbs per interval. It lets
-	// the baseline re-learn a slower filesystem, but only from intervals
-	// with no demand (no mover waited for a slot), so sustained saturation
-	// can't teach the governor that loaded latency is normal.
-	moverBaselineDrift = 0.05
+	// moverHoldAfterReject is how long the governor sits at the committed
+	// limit after a probe is rejected before probing again.
+	moverHoldAfterReject = 30 * time.Second
+
+	// moverDownProbeEvery makes every Nth probe from steady state a
+	// downward one, so a limit that drifted above the knee (through a
+	// noisy accepted probe) gets trimmed even if throughput never drops.
+	moverDownProbeEvery = 4
 )
 
 // moverGovernor adaptively sets how many spooled-blob copies into the main
-// blob directory may run concurrently, using an AIMD control loop driven by
-// the latency of small copies.
+// blob directory may run concurrently, by hill-climbing on measured copy
+// throughput.
 //
 // The main directory may be a network filesystem whose throughput for the
 // small, round-trip-bound copies that dominate the put queue scales with
-// concurrency until the filesystem saturates. Rather than guess a fixed
-// mover count, the governor grows the limit while small-copy latency stays
-// near its unloaded baseline and there is demand (movers waiting for a
-// slot), and backs off multiplicatively when latency climbs well above the
-// baseline. Without demand it holds, since there is nothing to learn from
-// an idle filesystem except its baseline latency.
+// concurrency until the filesystem saturates. Per-copy latency grows with
+// concurrency well before that point, so latency is not the signal;
+// throughput is. The governor holds a committed operating point (a limit
+// and the copies/s measured there) and probes: it raises the limit by a
+// step and keeps the raise only if copies/s rose by a meaningful fraction
+// of the ideal linear gain, and it lowers the limit when a trial at fewer
+// slots delivers the same throughput. Windows in which the slots weren't
+// kept busy (demand-limited) teach it nothing and are discarded.
 type moverGovernor struct {
 	minLimit int
 	maxLimit int
+	clock    func() time.Time
 
 	mu     sync.Mutex
 	cond   *sync.Cond // signaled when a slot frees or the limit grows
 	limit  int        // current maximum concurrent copies
 	active int        // copies currently running
-	waited bool       // whether any acquire had to wait this interval
 
-	probes   []time.Duration // probe copy latencies observed this interval
-	baseline time.Duration   // estimate of unloaded probe latency; 0 until learned
-	lastMed  time.Duration   // median probe latency of the last evaluated interval
+	// Current measurement window.
+	windowStart time.Time
+	lastAccrue  time.Time
+	busy        time.Duration // integral of active over the window
+	completions int           // successful copies finished in the window
 
-	increases, decreases int // adjustment counts for metrics
+	// Committed operating point and probe state.
+	committedLimit int
+	committedRate  float64 // copies/s measured at committedLimit; 0 until known
+	holdUntil      time.Time
+	probes         int // steady-state probes started, for alternating direction
+
+	increases, decreases, rejected int // for metrics
 }
 
 func newMoverGovernor(minLimit, maxLimit int) *moverGovernor {
@@ -95,12 +110,25 @@ func newMoverGovernor(minLimit, maxLimit int) *moverGovernor {
 		maxLimit = max(minLimit, defaultMaxPutMovers)
 	}
 	g := &moverGovernor{
-		minLimit: minLimit,
-		maxLimit: maxLimit,
-		limit:    minLimit,
+		minLimit:       minLimit,
+		maxLimit:       maxLimit,
+		clock:          time.Now,
+		limit:          minLimit,
+		committedLimit: minLimit,
 	}
 	g.cond = sync.NewCond(&g.mu)
+	now := g.clock()
+	g.windowStart, g.lastAccrue = now, now
 	return g
+}
+
+// accrueLocked advances the busy integral to now. It must be called before
+// any change to active or limit, and the caller must hold g.mu.
+func (g *moverGovernor) accrueLocked(now time.Time) {
+	if now.After(g.lastAccrue) {
+		g.busy += time.Duration(g.active) * now.Sub(g.lastAccrue)
+		g.lastAccrue = now
+	}
 }
 
 // acquire blocks until a copy slot is available under the current limit or
@@ -120,92 +148,159 @@ func (g *moverGovernor) acquire(ctx context.Context) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		g.waited = true
 		g.cond.Wait()
 	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	g.accrueLocked(g.clock())
 	g.active++
 	return nil
 }
 
-// release returns a slot taken by acquire.
-func (g *moverGovernor) release() {
+// release returns a slot taken by acquire. completed reports whether the
+// copy succeeded; only successful copies count toward throughput.
+func (g *moverGovernor) release(completed bool) {
 	g.mu.Lock()
+	g.accrueLocked(g.clock())
 	g.active--
+	if completed {
+		g.completions++
+	}
 	g.mu.Unlock()
 	g.cond.Signal()
 }
 
-// observe records a completed copy of a blob of storedSize bytes that took
-// d. Only copies small enough to be latency probes affect the limit.
-func (g *moverGovernor) observe(storedSize int64, d time.Duration) {
-	if storedSize > moverProbeMaxSize {
-		return
-	}
-	g.mu.Lock()
-	g.probes = append(g.probes, d)
-	g.mu.Unlock()
-}
-
-// adjust evaluates the interval's probe samples and demand and moves the
-// limit accordingly. It is called once per moverAdjustInterval by the
-// governor loop, and directly by tests.
-func (g *moverGovernor) adjust() {
+// evaluate closes the measurement window if it is ready and moves the
+// limit according to what it showed. It is called periodically by run, and
+// directly by tests.
+func (g *moverGovernor) evaluate(now time.Time) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	g.accrueLocked(now)
 
-	probes := g.probes
-	g.probes = nil
-	waited := g.waited
-	g.waited = false
-
-	if len(probes) < moverMinProbes {
+	elapsed := now.Sub(g.windowStart)
+	if elapsed < moverEvalInterval {
 		return
 	}
-	slices.Sort(probes)
-	med := probes[len(probes)/2]
-	g.lastMed = med
+	sparse := g.completions < moverMinCompletions
+	if sparse && elapsed < moverMaxEvalInterval {
+		return
+	}
+	rate := float64(g.completions) / elapsed.Seconds()
+	util := g.busy.Seconds() / (float64(g.limit) * elapsed.Seconds())
+	g.windowStart, g.busy, g.completions = now, 0, 0
 
-	if g.baseline == 0 || med < g.baseline {
-		// First estimate, or the filesystem is faster than we thought:
-		// adopt the new unloaded latency immediately.
-		g.baseline = med
-	} else if !waited {
-		// No demand this interval, so the latency was unloaded: let the
-		// baseline drift toward it to track a filesystem that slowed down.
-		g.baseline += time.Duration(float64(med-g.baseline) * moverBaselineDrift)
+	if sparse || util < moverMinUtilization {
+		// Demand-limited: the limit wasn't what bounded throughput, so
+		// the window says nothing about capacity. Any probe in flight
+		// stays in flight until a busy window judges it.
+		return
 	}
 
-	ratio := float64(med) / float64(g.baseline)
 	switch {
-	case ratio > moverDecreaseAbove:
-		newLimit := max(g.minLimit, g.limit*moverDecreaseNumer/moverDecreaseDenom)
-		if newLimit < g.limit {
-			g.limit = newLimit
-			g.decreases++
+	case g.committedRate == 0:
+		// First busy window: this is the starting operating point.
+		g.commitLocked(rate)
+		g.probeUpLocked()
+
+	case g.limit > g.committedLimit:
+		ideal := float64(g.limit)/float64(g.committedLimit) - 1
+		if rate/g.committedRate-1 >= moverGainFraction*ideal {
+			g.commitLocked(rate)
+			g.probeUpLocked()
+		} else {
+			g.rejectLocked(now)
 		}
-	case ratio < moverIncreaseBelow && waited:
-		newLimit := min(g.maxLimit, g.limit+max(1, g.limit/moverIncreaseDivisor))
-		if newLimit > g.limit {
-			g.limit = newLimit
-			g.increases++
-			g.cond.Broadcast()
+
+	case g.limit < g.committedLimit:
+		if rate >= g.committedRate*(1-moverLossTolerance) {
+			g.commitLocked(rate)
+			g.probeDownLocked()
+		} else {
+			g.rejectLocked(now)
+		}
+
+	default:
+		if rate < g.committedRate*(1-moverDropFraction) {
+			// Throughput fell at a limit that used to deliver more. Take
+			// the new rate as the truth and test whether the concurrency
+			// is now excess.
+			g.committedRate = rate
+			g.probeDownLocked()
+			return
+		}
+		g.committedRate = (g.committedRate + rate) / 2
+		if now.Before(g.holdUntil) {
+			return
+		}
+		g.probes++
+		if g.probes%moverDownProbeEvery == 0 {
+			g.probeDownLocked()
+		} else {
+			g.probeUpLocked()
 		}
 	}
 }
 
-// run calls adjust every moverAdjustInterval until ctx is done.
+// commitLocked records the current limit and the rate measured at it as the
+// operating point to compare future probes against.
+func (g *moverGovernor) commitLocked(rate float64) {
+	g.committedLimit = g.limit
+	g.committedRate = rate
+}
+
+func (g *moverGovernor) stepLocked() int {
+	return max(1, int(float64(g.committedLimit)*moverStepFraction))
+}
+
+// probeUpLocked raises the limit one step above the committed point, if the
+// maximum allows.
+func (g *moverGovernor) probeUpLocked() {
+	n := min(g.maxLimit, g.committedLimit+g.stepLocked())
+	if n > g.limit {
+		g.limit = n
+		g.increases++
+		g.cond.Broadcast()
+	}
+}
+
+// probeDownLocked lowers the limit one step below the committed point, if
+// the minimum allows.
+func (g *moverGovernor) probeDownLocked() {
+	n := max(g.minLimit, g.committedLimit-g.stepLocked())
+	if n < g.limit {
+		g.limit = n
+		g.decreases++
+	}
+}
+
+// rejectLocked abandons the probe in flight, returning to the committed
+// limit, and holds there for a while before probing again.
+func (g *moverGovernor) rejectLocked(now time.Time) {
+	g.rejected++
+	g.holdUntil = now.Add(moverHoldAfterReject)
+	switch {
+	case g.limit > g.committedLimit:
+		g.limit = g.committedLimit
+		g.decreases++
+	case g.limit < g.committedLimit:
+		g.limit = g.committedLimit
+		g.increases++
+		g.cond.Broadcast()
+	}
+}
+
+// run calls evaluate periodically until ctx is done.
 func (g *moverGovernor) run(ctx context.Context) {
-	t := time.NewTicker(moverAdjustInterval)
+	t := time.NewTicker(moverEvalInterval / 2)
 	defer t.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-t.C:
-			g.adjust()
+		case now := <-t.C:
+			g.evaluate(now)
 		}
 	}
 }
@@ -213,19 +308,22 @@ func (g *moverGovernor) run(ctx context.Context) {
 // moverStats is a snapshot of the governor's state for metrics.
 type moverStats struct {
 	limit, active        int
-	baseline, lastMedian time.Duration
+	committedLimit       int
+	committedRate        float64
 	increases, decreases int
+	rejected             int
 }
 
 func (g *moverGovernor) stats() moverStats {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	return moverStats{
-		limit:      g.limit,
-		active:     g.active,
-		baseline:   g.baseline,
-		lastMedian: g.lastMed,
-		increases:  g.increases,
-		decreases:  g.decreases,
+		limit:          g.limit,
+		active:         g.active,
+		committedLimit: g.committedLimit,
+		committedRate:  g.committedRate,
+		increases:      g.increases,
+		decreases:      g.decreases,
+		rejected:       g.rejected,
 	}
 }

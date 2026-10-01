@@ -603,20 +603,22 @@ func (srv *Server) start() error {
 			func() float64 { return float64(len(srv.putq.moverCh)) }},
 		{"gocached_put_queue_flush_backlog", "settled PUTs waiting for the metadata flusher; nonzero while SQLite commits are the constraint",
 			func() float64 { return float64(len(srv.putq.flushCh)) }},
-		{"gocached_put_queue_movers_limit", "current adaptive limit on concurrent copies into the main blob directory; grows while small-copy latency stays near baseline under demand, shrinks when it climbs",
+		{"gocached_put_queue_movers_limit", "current limit on concurrent copies into the main blob directory; the governor's committed operating point plus or minus a probe step while it tests whether more or fewer slots change throughput",
 			func() float64 { return float64(srv.putq.gov.stats().limit) }},
 		{"gocached_put_queue_movers_active", "copies into the main blob directory currently in flight; pinned at the limit with a nonzero mover backlog means the limit is what bounds the spooled lane",
 			func() float64 { return float64(srv.putq.gov.stats().active) }},
-		{"gocached_put_queue_movers_max", "configured upper bound on the adaptive mover limit; a limit sitting here under demand with baseline latency means the bound is too low",
+		{"gocached_put_queue_movers_max", "configured upper bound on the adaptive mover limit; a committed limit sitting here under demand means the bound is too low",
 			func() float64 { return float64(srv.putq.gov.maxLimit) }},
-		{"gocached_put_queue_copy_latency_baseline_seconds", "the mover governor's estimate of the main blob directory's unloaded small-copy latency",
-			func() float64 { return srv.putq.gov.stats().baseline.Seconds() }},
-		{"gocached_put_queue_copy_latency_recent_seconds", "median small-copy latency in the mover governor's last evaluated interval; its ratio to the baseline drives the limit",
-			func() float64 { return srv.putq.gov.stats().lastMedian.Seconds() }},
-		{"gocached_put_queue_movers_increases", "times the mover governor raised the limit",
+		{"gocached_put_queue_movers_committed_limit", "the concurrency the mover governor last judged worth running at: the highest limit at which adding slots still raised copies/s",
+			func() float64 { return float64(srv.putq.gov.stats().committedLimit) }},
+		{"gocached_put_queue_movers_committed_rate", "copies/s into the main blob directory the mover governor measured at its committed limit; the main directory's throughput ceiling for the current blob mix if the committed limit is below the max",
+			func() float64 { return srv.putq.gov.stats().committedRate }},
+		{"gocached_put_queue_movers_increases", "times the mover governor raised the limit (upward probes and reverts of downward ones)",
 			func() float64 { return float64(srv.putq.gov.stats().increases) }},
-		{"gocached_put_queue_movers_decreases", "times the mover governor lowered the limit; frequent decreases mean the main blob directory saturates at the current load",
+		{"gocached_put_queue_movers_decreases", "times the mover governor lowered the limit (downward probes and reverts of upward ones)",
 			func() float64 { return float64(srv.putq.gov.stats().decreases) }},
+		{"gocached_put_queue_movers_probes_rejected", "probes the mover governor reverted because the throughput change didn't justify the new limit; steady rejections in both directions mean it has found the knee",
+			func() float64 { return float64(srv.putq.gov.stats().rejected) }},
 	} {
 		reg.MustRegister(prometheus.NewGaugeFunc(prometheus.GaugeOpts{Name: g.name, Help: g.help}, g.fn))
 	}
@@ -813,9 +815,9 @@ func WithPutSpoolCapacity(bytes int64) ServerOption {
 
 // WithPutMoverLimits bounds the adaptive number of concurrent copies of
 // spooled blobs into the main blob directory. The server starts at minLimit
-// and raises the limit while the latency of small copies stays near its
-// unloaded baseline and copies are waiting for a slot, backing off when
-// latency climbs; maxLimit caps it. Zero for either uses the default (8 and
+// and hill-climbs on measured copy throughput: it keeps a higher limit only
+// if copies/s rose with it, and trims when fewer slots deliver the same
+// throughput; maxLimit caps it. Zero for either uses the default (8 and
 // 256). See gocached_put_queue_movers_* metrics for the observed behavior.
 func WithPutMoverLimits(minLimit, maxLimit int) ServerOption {
 	return func(srv *Server) {

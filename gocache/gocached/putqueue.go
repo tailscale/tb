@@ -224,9 +224,14 @@ func newPutQueue(srv *Server, dir string) *putQueue {
 // One mover goroutine is started per slot the governor could ever grant;
 // each takes a governor slot before copying, so the number of copies in
 // flight follows the governor's current limit, not the goroutine count.
+// Only the first minLimit of them also execute cleanup intent deletions,
+// which bounds that unlink traffic on the main directory to the same
+// concurrency as a fixed-mover server would have produced; letting every
+// goroutine do them turned each metadata flush into a burst of hundreds of
+// concurrent unlinks that doubled copy latency.
 func (q *putQueue) start(ctx context.Context) {
-	for range q.gov.maxLimit {
-		go q.moverLoop(ctx)
+	for i := range q.gov.maxLimit {
+		go q.moverLoop(ctx, i < q.gov.minLimit)
 	}
 	go q.gov.run(ctx)
 	go q.flusherLoop(ctx)
@@ -440,17 +445,22 @@ func (q *putQueue) spoolBlob(size int64, r io.Reader) (diskSize int64, path stri
 }
 
 // moverLoop copies spooled blobs into the main blob directory and passes
-// them on to the flusher. It also executes the post-commit cleanup intent
-// deletions the flusher hands back. Several movers run concurrently since
-// the main directory may be a high-latency network filesystem.
-func (q *putQueue) moverLoop(ctx context.Context) {
+// them on to the flusher. If deleteIntents is set it also executes the
+// post-commit cleanup intent deletions the flusher hands back. Several
+// movers run concurrently since the main directory may be a high-latency
+// network filesystem.
+func (q *putQueue) moverLoop(ctx context.Context, deleteIntents bool) {
+	intentDelCh := q.intentDelCh
+	if !deleteIntents {
+		intentDelCh = nil // never selected
+	}
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case p := <-q.moverCh:
 			q.moveToFlush(ctx, p)
-		case path := <-q.intentDelCh:
+		case path := <-intentDelCh:
 			if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 				q.srv.logf("put-queue: removing cleanup intent %v: %v", path, err)
 			}
@@ -487,14 +497,15 @@ func (q *putQueue) moveToFlush(ctx context.Context, p *pendingPut) {
 
 // copyUnderGovernor performs one attempt at p's intent write and blob copy
 // into the main blob directory while holding a mover governor slot, and
-// reports the attempt's latency to the governor and metrics.
-func (q *putQueue) copyUnderGovernor(ctx context.Context, p *pendingPut) error {
+// records the attempt's outcome with the governor and its latency in the
+// metrics.
+func (q *putQueue) copyUnderGovernor(ctx context.Context, p *pendingPut) (err error) {
 	if err := q.gov.acquire(ctx); err != nil {
 		return err
 	}
-	defer q.gov.release()
+	defer func() { q.gov.release(err == nil) }()
 	start := time.Now()
-	err := q.writeCleanupIntent(p)
+	err = q.writeCleanupIntent(p)
 	if err == nil {
 		err = q.copyToMain(p)
 	}
@@ -502,8 +513,6 @@ func (q *putQueue) copyUnderGovernor(ctx context.Context, p *pendingPut) error {
 	result := "ok"
 	if err != nil {
 		result = "error"
-	} else {
-		q.gov.observe(p.storedSize, d)
 	}
 	if q.srv.putCopyDuration != nil {
 		q.srv.putCopyDuration.WithLabelValues(result).Observe(d.Seconds())
