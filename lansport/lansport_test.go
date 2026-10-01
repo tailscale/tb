@@ -27,12 +27,12 @@ import (
 // it is virtual, so it costs nothing to wait out.
 const probeInterval = time.Second
 
-// rounds lets n probe rounds happen and everything they trigger settle.
-func rounds(n int) {
-	for range n {
-		time.Sleep(probeInterval)
-		synctest.Wait()
-	}
+// sleepAndWait advances the bubble's clock by d and then waits for every
+// goroutine the passage of time woke to finish what it was doing, so the
+// caller can assert on the resulting state. Callers say what d is for.
+func sleepAndWait(d time.Duration) {
+	time.Sleep(d)
+	synctest.Wait()
 }
 
 var (
@@ -80,13 +80,15 @@ func newStaticPair(t testing.TB, lan *lansporttest.LAN) (a, b *Server) {
 	advA, advB := net.JoinHostPort(ipA.String(), "7890"), net.JoinHostPort(ipB.String(), "7890")
 	a = newServer(t, lan, "a", ipA, advA, StaticSource("a", advB))
 	b = newServer(t, lan, "b", ipB, advB, StaticSource("b", advA))
-	// Round 0 runs at Listen: a can't reach b's advert yet (b didn't
-	// exist), b fetches a's advert but a doesn't know b's pin. Round 1: a
-	// fetches b's advert and its LAN check passes, since b knows a. b's
-	// LAN check races a's fetch, so allow one more round for it.
-	rounds(2)
+	// Each server probes once at Listen and then every probeInterval. At
+	// Listen, a can't reach b's advert (b doesn't exist yet) and b fetches
+	// a's advert but a doesn't yet know b's pin, so neither is reachable.
+	// One interval later a fetches b's advert and its LAN check passes,
+	// since b knows a; b's LAN check of a races a's fetch, so it may need
+	// the interval after that. Two intervals is therefore enough for both.
+	sleepAndWait(2 * probeInterval)
 	if len(a.Peers()) != 1 || len(b.Peers()) != 1 {
-		t.Fatalf("after two rounds: a sees %v, b sees %v", a.Peers(), b.Peers())
+		t.Fatalf("a sees %v, b sees %v; want one peer each", a.Peers(), b.Peers())
 	}
 	return a, b
 }
@@ -144,9 +146,9 @@ func TestStaticPair(t *testing.T) {
 		}
 		c.CloseIdleConnections()
 
-		// A peer going away drops out at the next round.
+		// A peer going away drops out at a's next probe, one interval on.
 		b.Close()
-		rounds(1)
+		sleepAndWait(probeInterval)
 		if len(a.Peers()) != 0 {
 			t.Errorf("a still sees %v after b closed", a.Peers())
 		}
@@ -167,7 +169,7 @@ func TestRestartRepins(t *testing.T) {
 		oldTransport := a.Peers()["b"].Transport
 		advB, tlsB := b.AdvertAddr().String(), b.TLSAddr().String()
 		b.Close()
-		rounds(1)
+		sleepAndWait(probeInterval) // for a's next probe to drop b
 		if len(a.Peers()) != 0 {
 			t.Fatalf("a still sees %v after b closed", a.Peers())
 		}
@@ -187,7 +189,9 @@ func TestRestartRepins(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer b2.Close()
-		rounds(2)
+		// Two intervals for a and the new b to reach each other, for the
+		// same reasons as in newStaticPair.
+		sleepAndWait(2 * probeInterval)
 		pb, ok := a.Peers()["b"]
 		if !ok {
 			t.Fatalf("a doesn't see the restarted b: %v", a.Peers())
@@ -281,7 +285,10 @@ func TestTailnetSource(t *testing.T) {
 		}
 		a := mk("a", tsA, ipA)
 		b := mk("b", tsB, ipB)
-		rounds(2)
+		// Two intervals for a and b to reach each other, for the same
+		// reasons as in newStaticPair; they learn of each other from the
+		// fake tailscaleds at start, before the first probe.
+		sleepAndWait(2 * probeInterval)
 		pb, ok := a.Peers()["stable-2"]
 		if !ok || pb.Name != "b" || pb.Addr != b.TLSAddr().String() {
 			t.Fatalf("a's peers = %+v", a.Peers())
