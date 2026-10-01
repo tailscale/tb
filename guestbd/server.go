@@ -98,7 +98,7 @@ func FileSource(path string) BaseImageSource {
 			f.Close()
 			return nil, err
 		}
-		key := fileIdentity(fi)
+		key := fileIdentity(f, fi)
 		if strings.HasSuffix(path, ".qcow2") {
 			img, err := qcow2.Open(f)
 			if err != nil {

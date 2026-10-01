@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"sync"
 	"testing"
@@ -1117,6 +1118,11 @@ func TestReconnectNoIdentity(t *testing.T) {
 }
 
 func TestBaseImageReplaced(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		// The server keeps the idle base image open for reuse, and
+		// Windows can't rename over a file that's open.
+		t.Skip("can't replace an open file by rename on Windows")
+	}
 	const pageSize = 4096
 	const numPages = 4
 	data1 := make([]byte, pageSize*numPages)
