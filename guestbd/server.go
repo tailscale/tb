@@ -12,7 +12,6 @@ import (
 	"slices"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/bradfitz/qcow2"
@@ -54,6 +53,7 @@ func (p *plainBaseImage) Close() error                            { return nil }
 func (p *plainBaseImage) BaseImageKey() any                       { return nil }
 
 // fileIdentityKey uniquely identifies an on-disk file by device and inode.
+// See fileIdentity.
 type fileIdentityKey struct {
 	dev uint64
 	ino uint64
@@ -63,7 +63,7 @@ type fileIdentityKey struct {
 type fileSizeReaderAt struct {
 	f    *os.File
 	size int64
-	key  fileIdentityKey
+	key  any // from fileIdentity
 }
 
 func (r *fileSizeReaderAt) ReadAt(p []byte, off int64) (int, error) { return r.f.ReadAt(p, off) }
@@ -76,7 +76,7 @@ func (r *fileSizeReaderAt) BaseImageKey() any                       { return r.k
 type qcow2SizeReaderAt struct {
 	img *qcow2.Image
 	f   *os.File
-	key fileIdentityKey
+	key any // from fileIdentity
 }
 
 func (r *qcow2SizeReaderAt) ReadAt(p []byte, off int64) (int, error) { return r.img.ReadAt(p, off) }
@@ -98,8 +98,7 @@ func FileSource(path string) BaseImageSource {
 			f.Close()
 			return nil, err
 		}
-		st := fi.Sys().(*syscall.Stat_t)
-		key := fileIdentityKey{dev: uint64(st.Dev), ino: st.Ino} // Dev is int32 on darwin
+		key := fileIdentity(fi)
 		if strings.HasSuffix(path, ".qcow2") {
 			img, err := qcow2.Open(f)
 			if err != nil {
