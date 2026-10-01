@@ -1026,6 +1026,19 @@ type noKeyBaseImage struct {
 
 func (n *noKeyBaseImage) BaseImageKey() any { return nil }
 
+// waitBaseImagesIdle waits for srv to have no active base images, as
+// happens once it has finished handling all disconnected clients.
+func waitBaseImagesIdle(t *testing.T, srv *Server) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for srv.baseImagesActive.Value() != 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("timeout waiting for base images to go idle; %d active", srv.baseImagesActive.Value())
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 func TestReconnectNoIdentity(t *testing.T) {
 	const pageSize = 4096
 	const numPages = 20
@@ -1076,6 +1089,10 @@ func TestReconnectNoIdentity(t *testing.T) {
 		c1.read(uint64(i*pageSize), pageSize)
 	}
 	c1.disconnect()
+
+	// Wait for the server to release the first connection's base image.
+	// Until then it is still active and would be shared, not replaced.
+	waitBaseImagesIdle(t, srv)
 
 	// Snapshot counters.
 	diskColdBefore := srv.readPath.Get("base_disk_cold").Value()
