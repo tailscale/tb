@@ -139,45 +139,45 @@ func TestPutQueueReserveCountCap(t *testing.T) {
 	}
 }
 
-func TestRenameCreatingDir(t *testing.T) {
-	dir := t.TempDir()
-	dst := filepath.Join(dir, "ab", "blob")
-	write := func(name string) string {
+func TestCreateCreatingDir(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "ab")
+	path := filepath.Join(dir, "file")
+	calls := 0
+	create := func() (*os.File, error) {
+		calls++
+		return os.Create(path)
+	}
+	check := func(wantCalls int) {
 		t.Helper()
-		src := filepath.Join(dir, name)
-		if err := os.WriteFile(src, []byte(name), 0644); err != nil {
-			t.Fatal(err)
+		f, err := createCreatingDir(dir, create)
+		if err != nil {
+			t.Fatalf("createCreatingDir: %v", err)
 		}
-		return src
+		f.Close()
+		if calls != wantCalls {
+			t.Errorf("create called %d times; want %d", calls, wantCalls)
+		}
+		calls = 0
 	}
 
-	// The parent doesn't exist yet: created on demand.
-	if err := renameCreatingDir(write("one"), dst); err != nil {
-		t.Fatalf("rename into missing dir: %v", err)
-	}
-	if got, err := os.ReadFile(dst); err != nil || string(got) != "one" {
-		t.Fatalf("dst = %q, %v; want %q", got, err, "one")
-	}
-
-	// The parent exists: the plain rename succeeds.
-	if err := renameCreatingDir(write("two"), dst); err != nil {
-		t.Fatalf("rename into existing dir: %v", err)
-	}
-
-	// The parent was removed out from under us: recreated, not cached.
-	if err := os.RemoveAll(filepath.Dir(dst)); err != nil {
+	// The directory doesn't exist yet: created on demand, then retried.
+	check(2)
+	// The directory exists: one call.
+	check(1)
+	// The directory was removed out from under us: recreated, not cached.
+	if err := os.RemoveAll(dir); err != nil {
 		t.Fatal(err)
 	}
-	if err := renameCreatingDir(write("three"), dst); err != nil {
-		t.Fatalf("rename after dir removal: %v", err)
-	}
-	if got, err := os.ReadFile(dst); err != nil || string(got) != "three" {
-		t.Fatalf("dst = %q, %v; want %q", got, err, "three")
-	}
+	check(2)
 
-	// A missing source is a real error, not something to paper over.
-	if err := renameCreatingDir(filepath.Join(dir, "nope"), dst); !errors.Is(err, fs.ErrNotExist) {
-		t.Fatalf("rename of missing src = %v, want not-exist", err)
+	// Other errors are returned as is, without creating anything.
+	errBoom := errors.New("boom")
+	other := filepath.Join(t.TempDir(), "other")
+	if _, err := createCreatingDir(other, func() (*os.File, error) { return nil, errBoom }); err != errBoom {
+		t.Errorf("err = %v; want %v", err, errBoom)
+	}
+	if _, err := os.Stat(other); !os.IsNotExist(err) {
+		t.Errorf("directory created after a non-ENOENT error: %v", err)
 	}
 }
 
@@ -410,8 +410,8 @@ func TestPutQueueSkipIntentWhenPresent(t *testing.T) {
 	if p2.intentPath != "" {
 		t.Errorf("intent %s written for an already-present blob", p2.intentPath)
 	}
-	if ents, err := os.ReadDir(q.cleanupDir); err != nil || len(ents) != 0 {
-		t.Errorf("cleanup dir has %d entries, err=%v; want none", len(ents), err)
+	if got := intentFiles(t, q); len(got) != 0 {
+		t.Errorf("intents written: %q; want none", got)
 	}
 	st.wantMetric(&st.srv.m.PutQueueCopySkips, 1)
 	if fi2, err := os.Stat(q.mainPath(p2)); err != nil || !os.SameFile(fi1, fi2) {
@@ -500,6 +500,28 @@ func TestPutQueueDrainHotInstall(t *testing.T) {
 	}
 }
 
+// intentFiles returns the cleanup intent files under q's cleanup directory,
+// in shard subdirectories or (from older versions) directly in it, as paths
+// relative to it.
+func intentFiles(t *testing.T, q *putQueue) []string {
+	t.Helper()
+	var ret []string
+	err := filepath.WalkDir(q.cleanupDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !d.IsDir() {
+			rel, _ := filepath.Rel(q.cleanupDir, path)
+			ret = append(ret, rel)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ret
+}
+
 func TestPutQueueCleanupIntents(t *testing.T) {
 	st := newServerTester(t)
 	q := st.srv.putq
@@ -529,8 +551,8 @@ func TestPutQueueCleanupIntents(t *testing.T) {
 	committed := makePending(t, q, 0, "aa01", bytes.Repeat([]byte("committed"), 1000))
 	q.enqueue(committed)
 	st.drain()
-	if ents, err := os.ReadDir(q.cleanupDir); err != nil || len(ents) != 0 {
-		t.Fatalf("cleanup dir has %d entries after drain, err=%v; want empty", len(ents), err)
+	if got := intentFiles(t, q); len(got) != 0 {
+		t.Fatalf("intents left after drain: %q", got)
 	}
 	if !exists(blobPath(committed.blobName())) {
 		t.Fatal("committed blob missing after drain")
@@ -611,6 +633,123 @@ func TestPutQueueCleanupIntents(t *testing.T) {
 	}
 	if exists(dueIntent) {
 		t.Error("moot intent not removed after commit")
+	}
+}
+
+// TestPutQueueShardedDirs checks that a copy creates its intent in the
+// blob's cleanup shard subdirectory and its temp file in the blob's own
+// shard directory, never in the shared top-level directories, creating
+// either directory if missing, and that the sweeper handles intents in
+// shard subdirectories and in the old flat layout alike.
+func TestPutQueueShardedDirs(t *testing.T) {
+	st := newServerTester(t)
+	q := st.srv.putq
+	now := st.srv.now().Unix()
+
+	p := makePending(t, q, 0, "ff01", bytes.Repeat([]byte("sharded"), 1000))
+	q.enqueue(p)
+	name := p.blobName()
+	shardDir := filepath.Join(st.srv.dir, name[:2])
+	if err := os.RemoveAll(shardDir); err != nil {
+		t.Fatal(err)
+	}
+
+	// The shard directories don't exist yet; both are created on demand.
+	if err := q.writeCleanupIntent(p); err != nil {
+		t.Fatal(err)
+	}
+	if want := filepath.Join(q.cleanupDir, name[:2], filepath.Base(p.intentPath)); p.intentPath != want {
+		t.Errorf("intent path = %s; want %s", p.intentPath, want)
+	}
+	if _, err := os.Stat(p.intentPath); err != nil {
+		t.Errorf("intent: %v", err)
+	}
+	if err := q.copyToMain(p); err != nil {
+		t.Fatal(err)
+	}
+	ents, err := os.ReadDir(shardDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ents) != 1 || ents[0].Name() != name {
+		t.Errorf("shard dir entries = %v; want just %s", ents, name)
+	}
+
+	// With the main directory's root read-only, a copy into an existing
+	// shard directory still works, so the temp file isn't created in the
+	// root. (Root ignores permissions, so this can't be checked as root.)
+	if os.Geteuid() != 0 {
+		p2 := makePending(t, q, 0, "ff02", bytes.Repeat([]byte("read-only root"), 1000))
+		if err := os.MkdirAll(filepath.Dir(q.mainPath(p2)), 0750); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(st.srv.dir, 0555); err != nil {
+			t.Fatal(err)
+		}
+		err := q.copyToMain(p2)
+		os.Chmod(st.srv.dir, 0755)
+		if err != nil {
+			t.Errorf("copy with a read-only main directory root: %v", err)
+		}
+	}
+
+	// The sweeper handles both layouts.
+	orphanSum := sha256.Sum256([]byte("sharded orphan"))
+	orphanName := hex.EncodeToString(orphanSum[:]) + ".lz4"
+	orphanBlob := filepath.Join(st.srv.dir, orphanName[:2], orphanName)
+	if err := os.MkdirAll(filepath.Dir(orphanBlob), 0750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(orphanBlob, []byte("orphan"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	writeAt := func(dir string, due int64, blob string) string {
+		t.Helper()
+		if err := os.MkdirAll(dir, 0750); err != nil {
+			t.Fatal(err)
+		}
+		path := filepath.Join(dir, fmt.Sprintf("%08x-%s", due, blob))
+		if err := os.WriteFile(path, nil, 0644); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	sharded := writeAt(filepath.Join(q.cleanupDir, orphanName[:2]), now-1, orphanName)
+	flat := writeAt(q.cleanupDir, now-1, orphanName)
+	future := writeAt(filepath.Join(q.cleanupDir, orphanName[:2]), now+1000, orphanName)
+	strange := filepath.Join(q.cleanupDir, "not-a-shard")
+	if err := os.Mkdir(strange, 0750); err != nil {
+		t.Fatal(err)
+	}
+
+	st.drain() // commits p, deleting its intent
+	if err := q.sweepCleanupIntents(); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{sharded, flat, orphanBlob} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Errorf("%s not swept: %v", path, err)
+		}
+	}
+	for _, path := range []string{future, strange, q.mainPath(p)} {
+		if _, err := os.Stat(path); err != nil {
+			t.Errorf("%s: %v; want kept", path, err)
+		}
+	}
+	if got, want := intentFiles(t, q), []string{filepath.Join(orphanName[:2], filepath.Base(future))}; !slices.Equal(got, want) {
+		t.Errorf("intents left = %q; want %q", got, want)
+	}
+	st.wantMetric(&st.srv.m.PutQueueOrphansSwept, 1)
+}
+
+func TestIsShardName(t *testing.T) {
+	for name, want := range map[string]bool{
+		"00": true, "bf": true, "ff": true, "9a": true,
+		"": false, "0": false, "abc": false, "BF": false, "g0": false, ".c": false,
+	} {
+		if got := isShardName(name); got != want {
+			t.Errorf("isShardName(%q) = %v; want %v", name, got, want)
+		}
 	}
 }
 
