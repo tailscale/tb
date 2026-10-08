@@ -448,7 +448,7 @@ func (srv *Server) start() error {
 	pipelineBuckets := prometheus.ExponentialBuckets(0.001, 2, 16)
 	srv.putCopyDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    "gocached_put_queue_copy_duration_seconds",
-		Help:    "wall time of each attempt to write a spooled blob's cleanup intent and copy it into the main blob directory, labeled by result: ok or error; small blobs' latency here drives the adaptive mover limit",
+		Help:    "wall time of each attempt to write a spooled blob's cleanup intent and copy it into the main blob directory, labeled by result: ok or error",
 		Buckets: pipelineBuckets,
 	}, []string{"result"})
 	srv.putFlushDuration = prometheus.NewHistogram(prometheus.HistogramOpts{
@@ -599,24 +599,14 @@ func (srv *Server) start() error {
 			func() float64 { return float64(srv.putq.pendingInline()) }},
 		{"gocached_put_queue_pending_inline_cap", "capacity of the inline lane in pending PUTs; compare with gocached_put_queue_pending_inline",
 			func() float64 { return putQueuePendingInlineCap }},
-		{"gocached_put_queue_mover_backlog", "spooled blobs not yet picked up by a mover goroutine, in addition to those a mover holds while waiting for a governor slot; nonzero while the movers are the constraint",
+		{"gocached_put_queue_mover_backlog", "spooled blobs waiting for a mover to start copying them into the main blob directory; nonzero while the movers are the constraint",
 			func() float64 { return float64(len(srv.putq.moverCh)) }},
 		{"gocached_put_queue_flush_backlog", "settled PUTs waiting for the metadata flusher; nonzero while SQLite commits are the constraint",
 			func() float64 { return float64(len(srv.putq.flushCh)) }},
-		{"gocached_put_queue_movers_limit", "current adaptive limit on concurrent copies into the main blob directory; grows while small-copy latency stays near baseline under demand, shrinks when it climbs",
-			func() float64 { return float64(srv.putq.gov.stats().limit) }},
-		{"gocached_put_queue_movers_active", "copies into the main blob directory currently in flight; pinned at the limit with a nonzero mover backlog means the limit is what bounds the spooled lane",
-			func() float64 { return float64(srv.putq.gov.stats().active) }},
-		{"gocached_put_queue_movers_max", "configured upper bound on the adaptive mover limit; a limit sitting here under demand with baseline latency means the bound is too low",
-			func() float64 { return float64(srv.putq.gov.maxLimit) }},
-		{"gocached_put_queue_copy_latency_baseline_seconds", "the mover governor's estimate of the main blob directory's unloaded small-copy latency",
-			func() float64 { return srv.putq.gov.stats().baseline.Seconds() }},
-		{"gocached_put_queue_copy_latency_recent_seconds", "median small-copy latency in the mover governor's last evaluated interval; its ratio to the baseline drives the limit",
-			func() float64 { return srv.putq.gov.stats().lastMedian.Seconds() }},
-		{"gocached_put_queue_movers_increases", "times the mover governor raised the limit",
-			func() float64 { return float64(srv.putq.gov.stats().increases) }},
-		{"gocached_put_queue_movers_decreases", "times the mover governor lowered the limit; frequent decreases mean the main blob directory saturates at the current load",
-			func() float64 { return float64(srv.putq.gov.stats().decreases) }},
+		{"gocached_put_queue_movers", "number of mover goroutines copying spooled blobs into the main blob directory",
+			func() float64 { return float64(srv.putq.numMovers) }},
+		{"gocached_put_queue_movers_active", "copies into the main blob directory currently in flight; pinned at gocached_put_queue_movers with a nonzero mover backlog means the mover count is what bounds the spooled lane",
+			func() float64 { return float64(srv.putq.activeCopies.Load()) }},
 	} {
 		reg.MustRegister(prometheus.NewGaugeFunc(prometheus.GaugeOpts{Name: g.name, Help: g.help}, g.fn))
 	}
@@ -811,16 +801,12 @@ func WithPutSpoolCapacity(bytes int64) ServerOption {
 	}
 }
 
-// WithPutMoverLimits bounds the adaptive number of concurrent copies of
-// spooled blobs into the main blob directory. The server starts at minLimit
-// and raises the limit while the latency of small copies stays near its
-// unloaded baseline and copies are waiting for a slot, backing off when
-// latency climbs; maxLimit caps it. Zero for either uses the default (8 and
-// 256). See gocached_put_queue_movers_* metrics for the observed behavior.
-func WithPutMoverLimits(minLimit, maxLimit int) ServerOption {
+// WithPutMovers sets how many goroutines copy spooled blobs into the main
+// blob directory concurrently. Zero or negative uses the default, 128, which
+// suits a network filesystem; there is little reason to change it.
+func WithPutMovers(n int) ServerOption {
 	return func(srv *Server) {
-		srv.putMoversMin = minLimit
-		srv.putMoversMax = maxLimit
+		srv.putMovers = max(n, 0)
 	}
 }
 
@@ -1040,8 +1026,7 @@ type Server struct {
 	hot            *hotIndex
 	putq           *putQueue
 	putSpoolCap    int64 // byte capacity of the put queue's spooled lane; 0 means derive from the spool filesystem
-	putMoversMin   int   // floor and starting point of the adaptive mover limit; 0 means default
-	putMoversMax   int   // ceiling of the adaptive mover limit; 0 means default
+	putMovers      int   // number of put-queue mover goroutines; 0 means defaultPutMovers
 	verbose        bool
 	logf           logger.Logf
 	clock          func() time.Time // if non-nil, alternate time.Now for testing

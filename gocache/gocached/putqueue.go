@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/pierrec/lz4/v4"
@@ -104,6 +105,18 @@ const (
 	// putFlushInterval.
 	putFlushBatchCap = 512
 
+	// defaultPutMovers is how many goroutines copy spooled blobs into the
+	// main blob directory when [WithPutMovers] isn't used. The main
+	// directory may be a network filesystem (in production, an NFS mount
+	// of S3 Files) where each copy is several round trips, so throughput
+	// comes from concurrency, not from any one copy finishing faster.
+	// Production peaks need roughly 55 concurrent copies (about 330
+	// spooled PUTs/s at 100ms each plus cleanup unlinks); 128 leaves
+	// headroom. When the filesystem saturates, extra movers just wait in
+	// the kernel's NFS request queue, costing a blocked OS thread each.
+	// A local-disk main directory handles this concurrency easily.
+	defaultPutMovers = 128
+
 	// putCopyRetries is how many times a mover attempts a blob's copy into
 	// the main blob directory before the pending PUT is dropped.
 	putCopyRetries = 3
@@ -168,9 +181,8 @@ type putQueue struct {
 	countSem  *semaphore.Weighted
 	inlineSem *semaphore.Weighted
 
-	// gov sets how many spooled-blob copies into the main blob directory
-	// run concurrently, adapting to the directory's observed latency.
-	gov *moverGovernor
+	numMovers    int          // number of mover goroutines; see defaultPutMovers
+	activeCopies atomic.Int64 // copies into the main blob directory in flight
 
 	// mu is a leaf mutex: no other lock is acquired while holding it.
 	mu      sync.Mutex
@@ -208,7 +220,7 @@ func newPutQueue(srv *Server, dir string) *putQueue {
 		bytesSem:    semaphore.NewWeighted(spoolCap),
 		countSem:    semaphore.NewWeighted(putQueuePendingCountCap),
 		inlineSem:   semaphore.NewWeighted(putQueuePendingInlineCap),
-		gov:         newMoverGovernor(srv.putMoversMin, srv.putMoversMax),
+		numMovers:   cmp.Or(srv.putMovers, defaultPutMovers),
 		pending:     make(map[actionKey]*pendingPut),
 		moverCh:     make(chan *pendingPut, putQueuePendingCountCap),
 		flushCh:     make(chan *pendingPut, putQueuePendingCountCap+putQueuePendingInlineCap),
@@ -220,15 +232,10 @@ func newPutQueue(srv *Server, dir string) *putQueue {
 // cleanup intent sweeper. It is not called under disableBackgroundLoops;
 // tests drive the pipeline with [Server.drainPendingPuts] and
 // [putQueue.sweepCleanupIntents] instead.
-//
-// One mover goroutine is started per slot the governor could ever grant;
-// each takes a governor slot before copying, so the number of copies in
-// flight follows the governor's current limit, not the goroutine count.
 func (q *putQueue) start(ctx context.Context) {
-	for range q.gov.maxLimit {
+	for range q.numMovers {
 		go q.moverLoop(ctx)
 	}
-	go q.gov.run(ctx)
 	go q.flusherLoop(ctx)
 	go q.runCleanupSweepLoop(ctx)
 }
@@ -471,7 +478,7 @@ func (q *putQueue) moveToFlush(ctx context.Context, p *pendingPut) {
 			case <-time.After(time.Second << (try - 1)):
 			}
 		}
-		err := q.copyUnderGovernor(ctx, p)
+		err := q.copyTimed(p)
 		if err == nil {
 			q.flushCh <- p
 			return
@@ -485,28 +492,22 @@ func (q *putQueue) moveToFlush(ctx context.Context, p *pendingPut) {
 	q.drop(p)
 }
 
-// copyUnderGovernor performs one attempt at p's intent write and blob copy
-// into the main blob directory while holding a mover governor slot, and
-// reports the attempt's latency to the governor and metrics.
-func (q *putQueue) copyUnderGovernor(ctx context.Context, p *pendingPut) error {
-	if err := q.gov.acquire(ctx); err != nil {
-		return err
-	}
-	defer q.gov.release()
+// copyTimed performs one attempt at p's intent write and blob copy into the
+// main blob directory and records the attempt's wall time.
+func (q *putQueue) copyTimed(p *pendingPut) error {
+	q.activeCopies.Add(1)
+	defer q.activeCopies.Add(-1)
 	start := time.Now()
 	err := q.writeCleanupIntent(p)
 	if err == nil {
 		err = q.copyToMain(p)
 	}
-	d := time.Since(start)
-	result := "ok"
-	if err != nil {
-		result = "error"
-	} else {
-		q.gov.observe(p.storedSize, d)
-	}
 	if q.srv.putCopyDuration != nil {
-		q.srv.putCopyDuration.WithLabelValues(result).Observe(d.Seconds())
+		result := "ok"
+		if err != nil {
+			result = "error"
+		}
+		q.srv.putCopyDuration.WithLabelValues(result).Observe(time.Since(start).Seconds())
 	}
 	return err
 }
