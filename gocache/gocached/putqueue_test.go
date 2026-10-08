@@ -384,6 +384,68 @@ func TestPutQueueDrain(t *testing.T) {
 	st.wantMetric(&st.srv.m.PutQueueFlushes, 0)
 }
 
+// TestPutQueueSkipIntentWhenPresent verifies that a spooled blob already in
+// the main blob directory is neither copied nor given a cleanup intent, and
+// still commits, while a new blob gets its intent as usual.
+func TestPutQueueSkipIntentWhenPresent(t *testing.T) {
+	st := newServerTester(t)
+	q := st.srv.putq
+	content := bytes.Repeat([]byte("present"), 1000)
+
+	p1 := makePending(t, q, 0, "ee01", content)
+	q.enqueue(p1)
+	st.drain()
+	st.wantMetric(&st.srv.m.PutQueueCopySkips, 0)
+	fi1, err := os.Stat(q.mainPath(p1))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A different action with the same output: its blob is already there.
+	p2 := makePending(t, q, 0, "ee02", content)
+	q.enqueue(p2)
+	if err := q.installInMain(p2); err != nil {
+		t.Fatal(err)
+	}
+	if p2.intentPath != "" {
+		t.Errorf("intent %s written for an already-present blob", p2.intentPath)
+	}
+	if ents, err := os.ReadDir(q.cleanupDir); err != nil || len(ents) != 0 {
+		t.Errorf("cleanup dir has %d entries, err=%v; want none", len(ents), err)
+	}
+	st.wantMetric(&st.srv.m.PutQueueCopySkips, 1)
+	if fi2, err := os.Stat(q.mainPath(p2)); err != nil || !os.SameFile(fi1, fi2) {
+		t.Errorf("present blob was replaced (err=%v)", err)
+	}
+
+	// A new blob still gets an intent before its copy.
+	p3 := makePending(t, q, 0, "ee03", bytes.Repeat([]byte("new"), 1000))
+	q.enqueue(p3)
+	if err := q.installInMain(p3); err != nil {
+		t.Fatal(err)
+	}
+	if p3.intentPath == "" {
+		t.Fatal("no intent written for a new blob")
+	}
+	if _, err := os.Stat(p3.intentPath); err != nil {
+		t.Errorf("intent for new blob: %v", err)
+	}
+	st.wantMetric(&st.srv.m.PutQueueCopySkips, 0)
+
+	// Both commit.
+	st.drain()
+	var n int
+	if err := st.srv.db.QueryRow("SELECT COUNT(*) FROM Actions").Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 3 {
+		t.Errorf("Actions rows = %d, want 3", n)
+	}
+	if _, err := os.Stat(q.mainPath(p3)); err != nil {
+		t.Errorf("new blob not installed: %v", err)
+	}
+}
+
 func TestPutQueueDrainFlushDup(t *testing.T) {
 	st := newServerTester(t)
 	q := st.srv.putq
