@@ -144,9 +144,16 @@ type pendingPut struct {
 	altOutputID      string         // the PUT's outputID, or "" if it equals sha256hex
 	createTime       int64          // unix seconds
 	smallData        []byte         // non-nil iff the object is stored inline (<= smallObjectSize)
-	queueFile        string         // path of the spool file holding the blob bytes; "" if inline
+	queueFile        string         // path of the spool file holding the blob bytes; "" if inline or existing
 	reservation      putReservation // queue room to release when the entry retires
 	intentPath       string         // path of the cleanup intent record; "" until a mover writes it
+
+	// existing is whether the PUT's blob was already stored when it
+	// arrived: in the hot tier, and so in the main blob directory. Its body
+	// was only hashed, to verify it matches, so the entry has no bytes of
+	// its own (no smallData or queueFile) and needs only its metadata
+	// committed, provided the blob is still stored then.
+	existing bool
 }
 
 // putReservation is the queue room held by one accepted PUT, returned by
@@ -162,10 +169,16 @@ type putReservation struct {
 // directories: the SHA-256 hex, with ".lz4" appended when the spooled bytes
 // are compressed (the same policy spoolBlob used to write them).
 func (p *pendingPut) blobName() string {
-	if p.uncompressedSize >= lz4CompressThreshold {
-		return p.sha256hex + ".lz4"
+	return blobFileName(p.sha256hex, p.uncompressedSize)
+}
+
+// blobFileName returns the base filename of the blob with the given
+// SHA-256 hex and uncompressed size in the main and hot blob directories.
+func blobFileName(sha256hex string, uncompressedSize int64) string {
+	if uncompressedSize >= lz4CompressThreshold {
+		return sha256hex + ".lz4"
 	}
-	return p.sha256hex
+	return sha256hex
 }
 
 // putQueue tracks PUTs that have been accepted (and their blob bytes safely
@@ -259,14 +272,7 @@ func (q *putQueue) start(ctx context.Context) {
 // capacity so a single blob bigger than the cap is still admitted (alone).
 func (q *putQueue) reserve(ctx context.Context, contentLength int64) (putReservation, error) {
 	if contentLength <= smallObjectSize {
-		if !q.inlineSem.TryAcquire(1) {
-			q.srv.m.PutQueueBlocked.Add(1)
-			q.srv.m.PutQueueBlockedInline.Add(1)
-			if err := q.inlineSem.Acquire(ctx, 1); err != nil {
-				return putReservation{}, err
-			}
-		}
-		return putReservation{inline: true}, nil
+		return q.reserveInlineLane(ctx)
 	}
 	reserved := min(contentLength, q.spoolCap)
 	if !q.bytesSem.TryAcquire(reserved) {
@@ -285,6 +291,21 @@ func (q *putQueue) reserve(ctx context.Context, contentLength int64) (putReserva
 		}
 	}
 	return putReservation{bytes: reserved}, nil
+}
+
+// reserveInlineLane reserves one slot in the inline lane, the lane that
+// drains only through the metadata flusher. Besides inline-sized PUTs, it
+// holds PUTs of blobs already stored (see [pendingPut.existing]), which
+// likewise have no bytes for the movers to copy.
+func (q *putQueue) reserveInlineLane(ctx context.Context) (putReservation, error) {
+	if !q.inlineSem.TryAcquire(1) {
+		q.srv.m.PutQueueBlocked.Add(1)
+		q.srv.m.PutQueueBlockedInline.Add(1)
+		if err := q.inlineSem.Acquire(ctx, 1); err != nil {
+			return putReservation{}, err
+		}
+	}
+	return putReservation{inline: true}, nil
 }
 
 // tryReserveInline is like reserve for an inline-sized object, but never
@@ -850,8 +871,13 @@ func (q *putQueue) flushBatch(batch []*pendingPut) error {
 	defer tx.Rollback()
 
 	dups := make([]bool, len(batch))
+	gone := make([]bool, len(batch))
 	for i, p := range batch {
 		dup, err := srv.insertPutTx(tx, p)
+		if errors.Is(err, errExistingBlobGone) {
+			gone[i] = true
+			continue
+		}
 		if err != nil {
 			return fmt.Errorf("inserting action %v: %w", p.key.ActionID, err)
 		}
@@ -862,11 +888,31 @@ func (q *putQueue) flushBatch(batch []*pendingPut) error {
 	}
 
 	srv.m.PutQueueFlushes.Add(1)
-	srv.m.PutQueueFlushedItems.Add(int64(len(batch)))
 	for i, p := range batch {
+		if gone[i] {
+			q.dropExistingGone(p)
+			continue
+		}
+		srv.m.PutQueueFlushedItems.Add(1)
 		q.finishCommitted(p, dups[i])
 	}
 	return nil
+}
+
+// dropExistingGone drops p, a PUT of an already-stored blob (see
+// [pendingPut.existing]) whose blob was no longer stored, or no longer
+// matched, when its metadata was to commit. Usually eviction removed it in
+// between, and the hot copy with it. The blob is also removed from the
+// hot tier in case it lingered there without its main copy and Blobs row,
+// as a crash in the middle of an eviction can leave it: otherwise every
+// later PUT of the blob would take the existing-blob path and be dropped
+// here in turn, rather than storing it again.
+func (q *putQueue) dropExistingGone(p *pendingPut) {
+	if !q.retire(p) {
+		return
+	}
+	q.srv.m.PutExistingGone.Add(1)
+	q.srv.removeFromHot(p.sha256hex)
 }
 
 // finishCommitted retires p after its metadata committed: it updates the
@@ -986,19 +1032,42 @@ intentDels:
 	return flushErr
 }
 
+// errExistingBlobGone is returned by [Server.insertPutTx] for a PUT of an
+// already-stored blob (see [pendingPut.existing]) whose blob has no Blobs
+// row, or a different stored size, by the time its metadata commits.
+var errExistingBlobGone = errors.New("existing blob no longer stored")
+
 // insertPutTx runs the two metadata inserts for p inside tx: the Blobs
 // upsert and the Actions insert. It reports whether the action already
 // existed (a duplicate PUT). The caller is responsible for holding
 // sqliteWriteMu and committing tx.
+//
+// For a PUT of an already-stored blob, the Blobs row must still exist with
+// the stored size the PUT saw, or it returns errExistingBlobGone and
+// inserts nothing: the PUT has no bytes of its own, so an action for a
+// blob that eviction has since removed would point at nothing. Eviction
+// deletes the Blobs row and the blob's files under the sqliteWriteMu the
+// caller holds, so a row seen here is a blob still on disk.
 func (s *Server) insertPutTx(tx *sql.Tx, p *pendingPut) (dup bool, err error) {
 	var blobID int64
-	err = tx.QueryRow(`INSERT INTO Blobs (SHA256, StoredSize, UncompressedSize, SmallData)
+	if p.existing {
+		var storedSize int64
+		err = tx.QueryRow(`SELECT BlobID, StoredSize FROM Blobs WHERE SHA256 = ?`, p.sha256hex).Scan(&blobID, &storedSize)
+		if errors.Is(err, sql.ErrNoRows) || err == nil && storedSize != p.storedSize {
+			return false, errExistingBlobGone
+		}
+		if err != nil {
+			return false, fmt.Errorf("Blobs lookup: %w", err)
+		}
+	} else {
+		err = tx.QueryRow(`INSERT INTO Blobs (SHA256, StoredSize, UncompressedSize, SmallData)
 		VALUES (?, ?, ?, ?)
 		ON CONFLICT(SHA256) DO UPDATE SET SHA256=excluded.SHA256
 		RETURNING BlobID;
 `, p.sha256hex, p.storedSize, p.uncompressedSize, p.smallData).Scan(&blobID)
-	if err != nil {
-		return false, fmt.Errorf("Blobs insert: %w", err)
+		if err != nil {
+			return false, fmt.Errorf("Blobs insert: %w", err)
+		}
 	}
 
 	res, err := tx.Exec(`INSERT OR IGNORE INTO Actions (NamespaceID, ActionID, BlobID, AltOutputID, CreateTime, AccessTime)
