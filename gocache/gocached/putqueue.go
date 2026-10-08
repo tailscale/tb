@@ -37,6 +37,14 @@ const putQueueDirName = ".put-queue"
 // spool) and the sweeper later deletes the unaccounted-for blob. The
 // fixed-width hex time makes lexical directory order chronological, so the
 // sweeper can stop at the first intent that isn't due yet.
+//
+// Intents live in subdirectories named for the blob's shard (the first two
+// hex digits of its name, like the main blob directory's), not directly in
+// this directory. On a network filesystem the kernel serializes creates and
+// unlinks within a directory, each holding the directory's lock for a
+// server round trip, so one shared directory caps every mover combined at
+// a few hundred intent operations a second. Intents written by older
+// versions directly in this directory are still swept.
 const cleanupDirName = ".cleanup"
 
 const (
@@ -547,9 +555,12 @@ func (q *putQueue) mainPath(p *pendingPut) string {
 func (q *putQueue) writeCleanupIntent(p *pendingPut) error {
 	if p.intentPath == "" {
 		due := q.srv.now().Add(cleanupIntentDelay).Unix()
-		p.intentPath = filepath.Join(q.cleanupDir, fmt.Sprintf("%08x-%s", due, p.blobName()))
+		name := p.blobName()
+		p.intentPath = filepath.Join(q.cleanupDir, name[:2], fmt.Sprintf("%08x-%s", due, name))
 	}
-	f, err := os.OpenFile(p.intentPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	f, err := createCreatingDir(filepath.Dir(p.intentPath), func() (*os.File, error) {
+		return os.OpenFile(p.intentPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	})
 	if err != nil {
 		return fmt.Errorf("writing cleanup intent: %w", err)
 	}
@@ -604,7 +615,48 @@ func (q *putQueue) sweepCleanupIntents() error {
 		return err
 	}
 	now := q.srv.now().Unix()
+	// Intents written by older versions sit directly in cleanupDir.
+	if err := q.sweepIntentDir(q.cleanupDir, ents, now); err != nil {
+		return err
+	}
 	for _, ent := range ents {
+		if !ent.IsDir() {
+			continue
+		}
+		name := ent.Name()
+		if !isShardName(name) {
+			q.srv.logf("put-queue: ignoring unexpected directory %q in cleanup dir", name)
+			continue
+		}
+		dir := filepath.Join(q.cleanupDir, name)
+		sub, err := os.ReadDir(dir)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return err
+		}
+		if err := q.sweepIntentDir(dir, sub, now); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// isShardName reports whether name is a blob shard directory name: the
+// first two lowercase hex digits of a blob's name.
+func isShardName(name string) bool {
+	return len(name) == 2 && strings.Trim(name, "0123456789abcdef") == ""
+}
+
+// sweepIntentDir processes the due cleanup intents among ents, the
+// contents of dir, as described at [putQueue.sweepCleanupIntents].
+// Subdirectories are skipped.
+func (q *putQueue) sweepIntentDir(dir string, ents []os.DirEntry, now int64) error {
+	for _, ent := range ents {
+		if ent.IsDir() {
+			continue
+		}
 		name := ent.Name()
 		due, blobName, ok := parseCleanupIntent(name)
 		if !ok {
@@ -638,7 +690,7 @@ func (q *putQueue) sweepCleanupIntents() error {
 		default:
 			return err
 		}
-		if err := os.Remove(filepath.Join(q.cleanupDir, name)); err != nil && !os.IsNotExist(err) {
+		if err := os.Remove(filepath.Join(dir, name)); err != nil && !os.IsNotExist(err) {
 			q.srv.logf("put-queue: removing cleanup intent %v: %v", name, err)
 		}
 	}
@@ -675,7 +727,15 @@ func (q *putQueue) copyToMain(p *pendingPut) error {
 	}
 	defer src.Close()
 
-	tf, err := os.CreateTemp(srv.dir, fmt.Sprintf("upload-%d-*", srv.now().Unix()))
+	// Create the temp file in the target's own shard directory, not the
+	// main directory's root, so that its create and its rename into place
+	// lock only that shard directory: on a network filesystem the kernel
+	// serializes a directory's creates, unlinks, and renames, each held
+	// for a server round trip.
+	shardDir := filepath.Dir(target)
+	tf, err := createCreatingDir(shardDir, func() (*os.File, error) {
+		return os.CreateTemp(shardDir, fmt.Sprintf("upload-%d-*", srv.now().Unix()))
+	})
 	if err != nil {
 		return err
 	}
@@ -685,28 +745,29 @@ func (q *putQueue) copyToMain(p *pendingPut) error {
 		os.Remove(tmpName)
 		return err
 	}
-	if err := renameCreatingDir(tmpName, target); err != nil {
+	if err := os.Rename(tmpName, target); err != nil {
 		os.Remove(tmpName)
 		return err
 	}
 	return nil
 }
 
-// renameCreatingDir renames src to dst, creating dst's parent directory if
-// it doesn't exist. It attempts the rename first so that the common case,
-// a shard directory that has existed since the first blob landed in it,
-// costs one filesystem operation instead of an MkdirAll round trip plus
-// the rename, and it recovers if the directory is removed out from under
-// the server rather than trusting any remembered state.
-func renameCreatingDir(src, dst string) error {
-	err := os.Rename(src, dst)
+// createCreatingDir calls create, which creates a file in dir, and if that
+// fails because dir doesn't exist, creates dir and calls create again. It
+// tries create first so that the common case, a directory that has existed
+// since the first file landed in it, costs one filesystem operation instead
+// of an MkdirAll round trip plus the create, and it recovers if the
+// directory is removed out from under the server rather than trusting any
+// remembered state.
+func createCreatingDir(dir string, create func() (*os.File, error)) (*os.File, error) {
+	f, err := create()
 	if !errors.Is(err, fs.ErrNotExist) {
-		return err
+		return f, err
 	}
-	if err := os.MkdirAll(filepath.Dir(dst), 0750); err != nil {
-		return err
+	if err := os.MkdirAll(dir, 0750); err != nil {
+		return nil, err
 	}
-	return os.Rename(src, dst)
+	return create()
 }
 
 // flusherLoop batches entries from flushCh into single SQLite transactions.
