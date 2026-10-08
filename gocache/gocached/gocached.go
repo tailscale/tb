@@ -1180,6 +1180,7 @@ type Server struct {
 		PutQueueBlockedSpoolBytes expvar.Int `type:"counter" name:"put_queue_blocked_spool_bytes" help:"PUT requests that waited on the spooled lane's byte cap; raise the spool capacity if the disk has room, or look at the movers if pending never drains"`
 		PutQueueBlockedSpoolCount expvar.Int `type:"counter" name:"put_queue_blocked_spool_count" help:"PUT requests that waited on the spooled lane's count cap; many small blobs are piling up faster than the movers copy them"`
 		PutQueueCopyErrs          expvar.Int `type:"counter" name:"put_queue_copy_errs" help:"failed attempts to copy a spooled blob into the main blob directory; retried before the PUT is dropped"`
+		PutQueueCopySkips         expvar.Int `type:"counter" name:"put_queue_copy_skips" help:"spooled blobs already present in the main blob directory with the expected size, so neither copied nor given a cleanup intent; a subset of gocached_put_queue_copy_duration_seconds_count"`
 		PutQueueDropped           expvar.Int `type:"counter" name:"put_queue_dropped" help:"pending PUTs abandoned after repeated copy or flush failures; the client saw success but the object was lost"`
 		PutQueueFlushes           expvar.Int `type:"counter" name:"put_queue_flushes" help:"metadata batch transactions committed by the put-queue flusher"`
 		PutQueueFlushedItems      expvar.Int `type:"counter" name:"put_queue_flushed_items" help:"pending PUTs whose metadata was committed by the put-queue flusher"`

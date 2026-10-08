@@ -492,16 +492,13 @@ func (q *putQueue) moveToFlush(ctx context.Context, p *pendingPut) {
 	q.drop(p)
 }
 
-// copyTimed performs one attempt at p's intent write and blob copy into the
-// main blob directory and records the attempt's wall time.
+// copyTimed performs one attempt at installing p's blob in the main blob
+// directory and records the attempt's wall time.
 func (q *putQueue) copyTimed(p *pendingPut) error {
 	q.activeCopies.Add(1)
 	defer q.activeCopies.Add(-1)
 	start := time.Now()
-	err := q.writeCleanupIntent(p)
-	if err == nil {
-		err = q.copyToMain(p)
-	}
+	err := q.installInMain(p)
 	if q.srv.putCopyDuration != nil {
 		result := "ok"
 		if err != nil {
@@ -510,6 +507,36 @@ func (q *putQueue) copyTimed(p *pendingPut) error {
 		q.srv.putCopyDuration.WithLabelValues(result).Observe(time.Since(start).Seconds())
 	}
 	return err
+}
+
+// installInMain makes p's blob present in the main blob directory.
+//
+// A blob already there with the expected size is left alone, since blobs
+// are content-addressed, and it gets no cleanup intent: this PUT creates no
+// file that the sweeper might have to reap. An intent wouldn't protect the
+// existing blob anyway. The sweeper keeps any blob that SQLite accounts
+// for or that a pending PUT references, which covers p until its metadata
+// commits. In production most spooled blobs are already present, and on a
+// network filesystem the intent's create and later unlink are the costly
+// part: they are mutations of the one cleanup directory, and the kernel
+// serializes those.
+//
+// Otherwise it writes p's cleanup intent and then copies the blob.
+func (q *putQueue) installInMain(p *pendingPut) error {
+	if fi, err := os.Stat(q.mainPath(p)); err == nil && fi.Size() == p.storedSize {
+		q.srv.m.PutQueueCopySkips.Add(1)
+		return nil
+	}
+	if err := q.writeCleanupIntent(p); err != nil {
+		return err
+	}
+	return q.copyToMain(p)
+}
+
+// mainPath returns the path of p's blob in the main blob directory.
+func (q *putQueue) mainPath(p *pendingPut) string {
+	name := p.blobName()
+	return filepath.Join(q.srv.dir, name[:2], name)
 }
 
 // writeCleanupIntent creates p's cleanup intent record: a durable note that
@@ -633,18 +660,14 @@ func (q *putQueue) pendingSHA(sha string) bool {
 	return false
 }
 
-// copyToMain installs p's spooled blob into the main blob directory, leaving
+// copyToMain copies p's spooled blob into the main blob directory, leaving
 // the spool file in place: it remains the bytes served for GETs of the
 // pending entry, and finishCommitted may later rename it into the hot tier.
-// A blob already present with the expected size is left alone; blobs are
-// content-addressed, so it holds the same bytes.
+// Callers use installInMain, which skips the copy if the blob is already
+// present.
 func (q *putQueue) copyToMain(p *pendingPut) error {
 	srv := q.srv
-	name := p.blobName()
-	target := filepath.Join(srv.dir, name[:2], name)
-	if fi, err := os.Stat(target); err == nil && fi.Size() == p.storedSize {
-		return nil
-	}
+	target := q.mainPath(p)
 
 	src, err := os.Open(p.queueFile)
 	if err != nil {
@@ -872,11 +895,7 @@ empty:
 	toFlush := batch[:0]
 	for _, p := range batch {
 		if p.queueFile != "" {
-			err := q.writeCleanupIntent(p)
-			if err == nil {
-				err = q.copyToMain(p)
-			}
-			if err != nil {
+			if err := q.installInMain(p); err != nil {
 				srv.logf("put-queue: copying blob %v to main dir: %v", p.sha256hex, err)
 				srv.m.PutQueueCopyErrs.Add(1)
 				q.drop(p)
