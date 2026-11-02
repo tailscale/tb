@@ -8,7 +8,6 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"io"
 	"os"
 	"testing"
 	"time"
@@ -55,14 +54,11 @@ func TestRealAWS(t *testing.T) {
 		if err != nil || o == nil {
 			t.Fatalf("Get(%d bytes) = %v, %v", size, o, err)
 		}
-		r, err := o.Reader()
-		if err != nil {
-			t.Fatal(err)
-		}
-		got, err := io.ReadAll(r)
+		var got bytes.Buffer
+		_, err = o.WriteTo(&got)
 		o.Close()
-		if err != nil || !bytes.Equal(got, data) || o.OutputID != "abcd" {
-			t.Fatalf("Get(%d bytes): got %d bytes, output %q, err %v", size, len(got), o.OutputID, err)
+		if err != nil || !bytes.Equal(got.Bytes(), data) || o.OutputID != "abcd" {
+			t.Fatalf("Get(%d bytes): got %d bytes, output %q, err %v", size, got.Len(), o.OutputID, err)
 		}
 		if o, err := c.Get(ctx, Grant{}, action); err != nil || o != nil {
 			t.Fatalf("Get from global = %v, %v; want miss", o, err)

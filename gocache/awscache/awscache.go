@@ -23,8 +23,12 @@
 // S3 holds lz4-compressed blobs at "<prefix><sha[:2]>/<sha>.lz4", content
 // addressed by the SHA-256 of the uncompressed bytes, computed by the
 // writer. Blobs are shared across namespaces and never overwritten (PUTs use
-// If-None-Match: *), and readers verify every blob's hash, so a bad blob is
-// a miss rather than a bad build.
+// If-None-Match: *).
+//
+// GETs stream blobs from S3 to the client without checking their hash, as
+// the writer computed it. A blob of the wrong size is a miss. A blob with
+// damaged content fails its lz4 frame checksum, which makes the response
+// fail before its end, so the client discards it.
 //
 // A PUT writes its blob before its metadata and returns once both are
 // durable, so an acknowledged PUT is readable from every host. The first PUT
@@ -43,7 +47,6 @@
 package awscache
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -175,16 +178,16 @@ type Config struct {
 	MaxObjectSize int64
 
 	// MemBudget bounds the bytes of objects buffered in memory at once
-	// while passing through GETs and PUTs. Objects that don't fit are
-	// buffered on disk in SpoolDir instead. Default 256MiB.
+	// while passing through PUTs. Objects that don't fit are buffered on
+	// disk in SpoolDir instead. Default 256MiB.
 	MemBudget int64
 
 	// SpoolDir is where objects that don't fit MemBudget are buffered.
 	// Default os.TempDir().
 	SpoolDir string
 
-	// SpoolCap bounds the total bytes buffered in SpoolDir at once; GETs
-	// and PUTs wait for space beyond it. Default 8GiB.
+	// SpoolCap bounds the total bytes buffered in SpoolDir at once; PUTs
+	// wait for space beyond it. Default 8GiB.
 	SpoolCap int64
 
 	// KnownBlobs is how many S3 blob keys known to exist this process
@@ -435,8 +438,10 @@ func (c *Cache) storageNS(ns Namespace) storageNS {
 	return storageNS(ns)
 }
 
-// Object is a cache hit returned by [Cache.Get]. Its bytes have been
-// verified. Callers must Close it.
+// Object is a cache hit returned by [Cache.Get]. Callers must Close it.
+//
+// A blob's bytes stream from S3 as they're read, without a hash check (see
+// the package docs). Use only one of WriteTo and LZ4, once.
 type Object struct {
 	// OutputID is the Go output ID (hex) stored with the action.
 	OutputID string
@@ -444,43 +449,57 @@ type Object struct {
 	// Size is the object's uncompressed size.
 	Size int64
 
-	inline []byte // if stored inline
-	sp     *spool // else the lz4 blob
+	inline   []byte        // if stored inline
+	blob     io.ReadCloser // else the lz4 blob
+	blobSize int64         // size of blob
 
 	// storage is where the object came from: "inline" or "s3".
 	storage string
 }
 
-// Reader returns a reader of the object's uncompressed bytes. It must not be
-// called concurrently with another Reader or LZ4.
-func (o *Object) Reader() (io.Reader, error) {
-	if o.sp == nil {
-		return bytes.NewReader(o.inline), nil
+// WriteTo writes the object's uncompressed bytes to w.
+//
+// It writes the last byte only after the lz4 frame checksum is correct.
+// Thus a client that knows Size gets a short body if the blob is damaged.
+func (o *Object) WriteTo(w io.Writer) (int64, error) {
+	if o.blob == nil {
+		n, err := w.Write(o.inline)
+		return int64(n), err
 	}
-	r, err := o.sp.Reader()
+	zr := lz4.NewReader(o.blob)
+	if o.Size == 0 {
+		_, err := io.Copy(io.Discard, zr)
+		return 0, err
+	}
+	n, err := io.CopyN(w, zr, o.Size-1)
 	if err != nil {
-		return nil, err
+		return n, err
 	}
-	return lz4.NewReader(r), nil
+	var last [1]byte
+	if _, err := io.ReadFull(zr, last[:]); err != nil {
+		return n, err
+	}
+	// The frame checksum is checked at the end of the frame.
+	if _, err := io.ReadFull(zr, make([]byte, 1)); err != io.EOF {
+		return n, fmt.Errorf("lz4 blob doesn't end after %d bytes: %v", o.Size, err)
+	}
+	m, err := w.Write(last[:])
+	return n + int64(m), err
 }
 
 // LZ4 returns a reader of the object as an lz4 frame and its size, if the
 // object is stored compressed. Otherwise it returns ok false.
 func (o *Object) LZ4() (r io.Reader, size int64, ok bool) {
-	if o.sp == nil {
+	if o.blob == nil {
 		return nil, 0, false
 	}
-	sr, err := o.sp.Reader()
-	if err != nil {
-		return nil, 0, false
-	}
-	return sr, o.sp.Size(), true
+	return o.blob, o.blobSize, true
 }
 
-// Close releases the object's buffer.
+// Close releases the object's resources.
 func (o *Object) Close() error {
-	if o.sp != nil {
-		o.sp.Close()
+	if o.blob != nil {
+		return o.blob.Close()
 	}
 	return nil
 }
@@ -505,7 +524,7 @@ func validHex(x string) bool {
 var ErrBadID = errors.New("awscache: malformed action or output ID")
 
 // Get looks up actionID in the namespaces g may read, returning (nil, nil)
-// on a miss. A hit's bytes are fetched and verified before Get returns.
+// on a miss. A hit's bytes stream from storage as they're read.
 func (c *Cache) Get(ctx context.Context, g Grant, actionID string) (*Object, error) {
 	o, _, err := c.get(ctx, g, actionID)
 	return o, err
@@ -537,12 +556,18 @@ func (c *Cache) get(ctx context.Context, g Grant, actionID string) (_ *Object, b
 		c.m.corruptBlobs.Inc()
 		return nil, false, nil
 	}
-	sp, err := c.fetchBlob(ctx, key, e)
-	if err != nil || sp == nil {
+	blob, err := c.openBlob(ctx, key, e)
+	if err != nil || blob == nil {
 		return nil, false, err
 	}
 	bumped = c.bumper.maybeEnqueue(key, e.AccessTime)
-	return &Object{OutputID: e.OutputID, Size: e.Size, sp: sp, storage: "s3"}, bumped, nil
+	return &Object{
+		OutputID: e.OutputID,
+		Size:     e.Size,
+		blob:     blob,
+		blobSize: e.StoredSize,
+		storage:  "s3",
+	}, bumped, nil
 }
 
 // lookupAction finds actionID in the global namespace or, failing that, g's
@@ -578,21 +603,13 @@ func (c *Cache) lookupAction(ctx context.Context, g Grant, actionID string) (key
 	}
 }
 
-// fetchBlob fetches the blob of the non-inline action e (at key) into a
-// spool and verifies it, returning (nil, nil) if it's missing or bad.
-func (c *Cache) fetchBlob(ctx context.Context, key string, e *actionEntry) (*spool, error) {
-	// Bound what we'll read, in case the entry is corrupt. lz4 frames of
-	// incompressible data are a little larger than the data.
-	if e.StoredSize < 0 || e.StoredSize > max(e.Size, 0)+e.Size/128+1<<10 {
-		c.logf("awscache: GET %s: corrupt entry: stored size %d for size %d", key, e.StoredSize, e.Size)
-		c.m.corruptBlobs.Inc()
-		return nil, nil
-	}
-
+// openBlob opens the blob of the non-inline action e (at key). It returns
+// (nil, nil) if the blob is missing or isn't the size e says.
+func (c *Cache) openBlob(ctx context.Context, key string, e *actionEntry) (io.ReadCloser, error) {
 	// TODO(bradfitz): first try the optional same-AZ read-through NVMe
 	// cache pool (see Config), hedging to S3 directly if the pool doesn't
 	// start answering quickly. Until then, every blob GET goes to S3.
-	rc, err := c.blobs.Get(ctx, blobKey(c.cfg.BlobPrefix, e.SHA256))
+	rc, size, err := c.blobs.Get(ctx, blobKey(c.cfg.BlobPrefix, e.SHA256))
 	if errors.Is(err, errBlobNotFound) {
 		// PUT writes the blob before the action, so this means the
 		// scrubber deleted the blob after this action's last use. Treat it
@@ -608,49 +625,13 @@ func (c *Cache) fetchBlob(ctx context.Context, key string, e *actionEntry) (*spo
 	if err != nil {
 		return nil, fmt.Errorf("fetching blob %s: %w", e.SHA256, err)
 	}
-	defer rc.Close()
-
-	sp, err := c.newSpool(ctx, e.StoredSize)
-	if err != nil {
-		return nil, err
-	}
-	if n, err := io.Copy(sp, io.LimitReader(rc, e.StoredSize+1)); err != nil {
-		sp.Close()
-		return nil, fmt.Errorf("reading blob %s: %w", e.SHA256, err)
-	} else if n != e.StoredSize {
-		sp.Close()
-		c.logf("awscache: GET %s: blob %s is %d bytes; want %d", key, e.SHA256, n, e.StoredSize)
+	if size != e.StoredSize {
+		rc.Close()
+		c.logf("awscache: GET %s: blob %s is %d bytes; want %d", key, e.SHA256, size, e.StoredSize)
 		c.m.corruptBlobs.Inc()
 		return nil, nil
 	}
-	if err := verifyLZ4(sp, e.Size, e.SHA256); err != nil {
-		sp.Close()
-		c.logf("awscache: GET %s: blob %s: %v", key, e.SHA256, err)
-		c.m.corruptBlobs.Inc()
-		return nil, nil
-	}
-	return sp, nil
-}
-
-// verifyLZ4 checks that sp holds an lz4 frame of size bytes whose SHA-256
-// is wantHex.
-func verifyLZ4(sp *spool, size int64, wantHex string) error {
-	r, err := sp.Reader()
-	if err != nil {
-		return err
-	}
-	h := sha256.New()
-	n, err := io.Copy(h, io.LimitReader(lz4.NewReader(r), size+1))
-	if err != nil {
-		return fmt.Errorf("decompressing: %w", err)
-	}
-	if n != size {
-		return fmt.Errorf("decompressed to %d bytes; want %d", n, size)
-	}
-	if got := hex.EncodeToString(h.Sum(nil)); got != wantHex {
-		return fmt.Errorf("content has sha256 %s", got)
-	}
-	return nil
+	return rc, nil
 }
 
 // putResult is the outcome of a put: whether and where it stored the object.

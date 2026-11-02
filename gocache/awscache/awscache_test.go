@@ -13,12 +13,12 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/pierrec/lz4/v4"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/tailscale/tb/gocache/cachers"
 )
@@ -130,15 +130,15 @@ func (f *fakeBlobs) Put(ctx context.Context, key string, r io.ReadSeeker, size i
 	return nil
 }
 
-func (f *fakeBlobs) Get(ctx context.Context, key string) (io.ReadCloser, error) {
+func (f *fakeBlobs) Get(ctx context.Context, key string) (io.ReadCloser, int64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.gets++
 	b, ok := f.blobs[key]
 	if !ok {
-		return nil, errBlobNotFound
+		return nil, 0, errBlobNotFound
 	}
-	return io.NopCloser(bytes.NewReader(b)), nil
+	return io.NopCloser(bytes.NewReader(b)), int64(len(b)), nil
 }
 
 func (f *fakeBlobs) counts() (puts, heads, gets int) {
@@ -412,42 +412,74 @@ func TestBadBlobs(t *testing.T) {
 	env := newTestEnv(t)
 	c := env.newCache(nil)
 	cl := env.newClient(c, writeGlobal)
-	data := bytes.Repeat([]byte("x"), 1000)
-	cl.put("ffff01", "0f01", data)
+	cl.put("ffff01", "0f01", randBytes(1000))
 	cl.put("ffff02", "0f02", randBytes(1000))
-	cl.put("ffff03", "0f03", randBytes(1000))
 
-	// Replace ffff01's blob with a valid lz4 frame of other content.
+	// Truncate ffff01's blob.
 	e1, _ := env.meta.get(actionKey(c.globalNS, "ffff01"))
-	var zb bytes.Buffer
-	zw := lz4.NewWriter(&zb)
-	zw.Write(bytes.Repeat([]byte("y"), 1000))
-	zw.Close()
 	env.blobs.mu.Lock()
-	env.blobs.blobs[blobKey("pfx/", e1.SHA256)] = zb.Bytes()
-	env.blobs.mu.Unlock()
-	e1.StoredSize = int64(zb.Len())
-	env.meta.set(actionKey(c.globalNS, "ffff01"), e1)
-
-	// Truncate ffff02's blob.
-	e2, _ := env.meta.get(actionKey(c.globalNS, "ffff02"))
-	env.blobs.mu.Lock()
-	bk := blobKey("pfx/", e2.SHA256)
+	bk := blobKey("pfx/", e1.SHA256)
 	env.blobs.blobs[bk] = env.blobs.blobs[bk][:10]
 
-	// Delete ffff03's blob, as the scrubber might.
-	e3, _ := env.meta.get(actionKey(c.globalNS, "ffff03"))
-	delete(env.blobs.blobs, blobKey("pfx/", e3.SHA256))
+	// Delete ffff02's blob, as the scrubber might.
+	e2, _ := env.meta.get(actionKey(c.globalNS, "ffff02"))
+	delete(env.blobs.blobs, blobKey("pfx/", e2.SHA256))
 	env.blobs.mu.Unlock()
 
 	cl.wantMiss("ffff01")
 	cl.wantMiss("ffff02")
-	cl.wantMiss("ffff03")
-	if got := testutil.ToFloat64(c.m.corruptBlobs); got != 2 {
-		t.Errorf("corrupt blobs = %v; want 2", got)
+	if got := testutil.ToFloat64(c.m.corruptBlobs); got != 1 {
+		t.Errorf("corrupt blobs = %v; want 1", got)
 	}
 	if got := testutil.ToFloat64(c.m.danglingActions); got != 1 {
 		t.Errorf("dangling actions = %v; want 1", got)
+	}
+}
+
+// TestDamagedBlob checks that a blob of the right size with damaged content
+// makes the response fail before its end, with and without lz4.
+func TestDamagedBlob(t *testing.T) {
+	env := newTestEnv(t)
+	c := env.newCache(nil)
+	cl := env.newClient(c, writeGlobal)
+	data := randBytes(1000)
+	cl.put("fafa01", "0f01", data)
+
+	e, _ := env.meta.get(actionKey(c.globalNS, "fafa01"))
+	env.blobs.mu.Lock()
+	b := env.blobs.blobs[blobKey("pfx/", e.SHA256)]
+	b[len(b)/2] ^= 1
+	env.blobs.mu.Unlock()
+
+	// With lz4, the client's lz4 reader finds the damage.
+	dir := t.TempDir()
+	cl.hc.Disk = &cachers.DiskCache{Dir: dir}
+	if out, _, err := cl.hc.Get(context.Background(), "fafa01"); err == nil {
+		t.Errorf("lz4 Get = %q, nil; want error", out)
+	}
+	if ents, _ := os.ReadDir(filepath.Join(dir, "0f")); len(ents) != 0 {
+		t.Errorf("client cached %d files from a damaged blob", len(ents))
+	}
+
+	// Without lz4, the server finds the damage and holds back the last byte.
+	req, _ := http.NewRequest("GET", cl.hc.BaseURL+"/action/fafa01", nil)
+	req.Header.Set("Want-Object", "1")
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	got, err := io.ReadAll(res.Body)
+	if err == nil {
+		t.Errorf("plain GET read %d bytes with no error; want error", len(got))
+	}
+	if len(got) >= len(data) {
+		t.Errorf("plain GET read %d bytes; want fewer than %d", len(got), len(data))
+	}
+	// Only the plain GET is a server error: with lz4, the server streamed
+	// the blob without error.
+	if st := cl.h.Stats(); st.GetErrs != 1 {
+		t.Errorf("GetErrs = %d; want 1", st.GetErrs)
 	}
 }
 

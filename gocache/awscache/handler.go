@@ -183,33 +183,36 @@ func (h *Handler) serveGet(w http.ResponseWriter, r *http.Request) {
 	hdr := w.Header()
 	hdr.Set("Content-Type", "application/octet-stream")
 	hdr.Set("Go-Output-Id", o.OutputID)
-	var body io.Reader
+	var body io.WriterTo = o
 	if zr, zsize, ok := o.LZ4(); ok && requestAcceptsEncoding(r, "lz4") {
 		hdr.Set("Content-Encoding", "lz4")
 		hdr.Set("Content-Length", strconv.FormatInt(zsize, 10))
 		hdr.Set("X-Uncompressed-Length", strconv.FormatInt(o.Size, 10))
-		body = zr
+		// The client checks the lz4 frame checksum.
+		body = readerWriterTo{zr}
 	} else {
 		hdr.Set("Content-Length", strconv.FormatInt(o.Size, 10))
-		body, err = o.Reader()
-		if err != nil {
-			typ = "error"
-			http.Error(w, "internal error", http.StatusInternalServerError)
-			return
-		}
 	}
 	if r.Method == "HEAD" {
 		return
 	}
-	n, err := io.Copy(w, body)
+	n, err := body.WriteTo(w)
 	h.st.getBytes.Add(n)
-	if err != nil && r.Context().Err() == nil {
-		// Headers are already sent, so all we can do is cut the response
-		// short; the client sees a short body and errors.
-		c.logf("awscache: GET %s: writing response: %v", actionID, err)
+	if err != nil {
+		// The headers are already sent. Abort the response, so that the
+		// client sees a broken body and discards it.
+		if r.Context().Err() == nil {
+			c.logf("awscache: GET %s: writing response: %v", actionID, err)
+		}
 		typ = "error"
+		panic(http.ErrAbortHandler)
 	}
 }
+
+// readerWriterTo is an [io.WriterTo] that copies from r.
+type readerWriterTo struct{ r io.Reader }
+
+func (rw readerWriterTo) WriteTo(w io.Writer) (int64, error) { return io.Copy(w, rw.r) }
 
 // PUT body read deadlines, as in gocached: a minimum upload rate plus a
 // flat grace, capped.

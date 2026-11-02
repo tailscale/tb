@@ -70,7 +70,7 @@ func newMetrics() *metrics {
 		}),
 		corruptBlobs: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "gocache_aws_corrupt_blobs_total",
-			Help: "gets whose blob failed to decompress or didn't match its SHA-256 or size, served as misses; should be zero",
+			Help: "gets whose blob in S3 wasn't the size its action said, served as misses; should be zero",
 		}),
 		blobUploads: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "gocache_aws_blob_uploads_total",
@@ -86,11 +86,11 @@ func newMetrics() *metrics {
 		}, []string{"how"}),
 		spoolBytes: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "gocache_aws_spool_reserved_bytes",
-			Help: "bytes reserved by in-flight gets and puts buffering objects, labeled by where (mem or disk)",
+			Help: "bytes reserved by in-flight puts buffering objects, labeled by where (mem or disk)",
 		}, []string{"where"}),
 		spoolBlocked: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "gocache_aws_spool_blocked_total",
-			Help: "gets and puts that had to wait for disk spool capacity",
+			Help: "puts that had to wait for disk spool capacity",
 		}),
 		atimeQueued: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "gocache_aws_atime_bumps_queued_total",

@@ -83,9 +83,9 @@ type blobStore interface {
 	// the existing blob in place.
 	Put(ctx context.Context, key string, r io.ReadSeeker, size int64) error
 
-	// Get opens the blob at key, returning [errBlobNotFound] if it doesn't
-	// exist.
-	Get(ctx context.Context, key string) (io.ReadCloser, error)
+	// Get opens the blob at key and returns its size, or returns
+	// [errBlobNotFound] if it doesn't exist.
+	Get(ctx context.Context, key string) (_ io.ReadCloser, size int64, _ error)
 }
 
 // Item key prefixes in the single DynamoDB table. The separator '#' and the
@@ -411,7 +411,7 @@ func (s *s3Store) Put(ctx context.Context, key string, r io.ReadSeeker, size int
 	return err
 }
 
-func (s *s3Store) Get(ctx context.Context, key string) (_ io.ReadCloser, retErr error) {
+func (s *s3Store) Get(ctx context.Context, key string) (_ io.ReadCloser, size int64, retErr error) {
 	start := time.Now()
 	result := "ok"
 	// This measures time to first byte; the body streams afterwards.
@@ -421,9 +421,9 @@ func (s *s3Store) Get(ctx context.Context, key string) (_ io.ReadCloser, retErr 
 		var nsk *s3types.NoSuchKey
 		if errors.As(err, &nsk) || isHTTPStatus(err, http.StatusNotFound) {
 			result = "miss"
-			return nil, errBlobNotFound
+			return nil, 0, errBlobNotFound
 		}
-		return nil, err
+		return nil, 0, err
 	}
-	return out.Body, nil
+	return out.Body, aws.ToInt64(out.ContentLength), nil
 }

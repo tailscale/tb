@@ -17,8 +17,7 @@ import (
 // a cache: its bytes are discarded on Close.
 //
 // Objects are buffered whole rather than streamed so that PUTs can hash
-// content before choosing its S3 key, and GETs can verify a blob's hash
-// before sending any of it to the client.
+// content before choosing its S3 key.
 type spool struct {
 	buf  *bytes.Buffer // non-nil if in memory
 	f    *os.File      // non-nil if on disk
