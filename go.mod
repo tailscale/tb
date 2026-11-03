@@ -20,6 +20,7 @@ require (
 	github.com/prometheus/client_model v0.6.3
 	golang.org/x/net v0.59.0
 	golang.org/x/sync v0.23.0
+	golang.org/x/sys v0.48.0
 	golang.org/x/time v0.16.0
 	gvisor.dev/gvisor v0.0.0-20260915211658-a6f909f08a72
 	modernc.org/sqlite v1.51.0
@@ -73,7 +74,6 @@ require (
 	go4.org/netipx v0.0.0-20260823151212-3075585bcbeb // indirect
 	golang.org/x/crypto v0.57.0 // indirect
 	golang.org/x/exp v0.0.0-20260908205506-85c1c2202aba // indirect
-	golang.org/x/sys v0.48.0 // indirect
 	golang.zx2c4.com/wireguard/windows v1.0.1 // indirect
 	google.golang.org/protobuf v1.36.12 // indirect
 	modernc.org/libc v1.72.3 // indirect
