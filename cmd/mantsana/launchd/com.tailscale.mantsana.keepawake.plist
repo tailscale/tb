@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  com.tailscale.mantsana.keepawake keeps the CI user's login session from
+  going idle, so it never sleeps or locks. Restoring a VM's saved state needs
+  the session unlocked (see DESIGN.md sections 4.1 and 9), and on Macs whose
+  MDM enforces an idle screen lock, holding sleep assertions alone isn't
+  enough: this also declares the user active (caffeinate -u).
+
+  caffeinate -u holds its assertions only for -t seconds, and the idle
+  screen saver starts the moment they lapse (the real idle time is long
+  past the limit), so there must never be a gap between them: a new
+  600-second caffeinate starts every 300 seconds, overlapping the previous
+  one. (Letting launchd restart a single caffeinate left a 20-second gap,
+  enough for the screen saver and then the lock.) launchd restarts the loop
+  if it dies.
+
+  Install for the logged-in CI user:
+
+    cp com.tailscale.mantsana.keepawake.plist ~/Library/LaunchAgents/
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.tailscale.mantsana.keepawake.plist
+
+  Remove:
+
+    launchctl bootout gui/$(id -u)/com.tailscale.mantsana.keepawake
+    rm ~/Library/LaunchAgents/com.tailscale.mantsana.keepawake.plist
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.tailscale.mantsana.keepawake</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/sh</string>
+		<string>-c</string>
+		<string>while :; do /usr/bin/caffeinate -dimsu -t 600 &amp; sleep 300; done</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>ProcessType</key>
+	<string>Interactive</string>
+</dict>
+</plist>
