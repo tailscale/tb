@@ -3118,26 +3118,36 @@ func (srv *Server) cleanupTick(ctx context.Context) (countAndSize, error) {
 	all.Count += dCount
 	all.Size += dBytes
 
-	// Default cutoff to "any age" for size-only cleanup. evictOldestActions
-	// still uses idx_actions_access (the WHERE/ORDER BY drive the plan), so
-	// the very-large cutoff just means "no upper bound".
-	cutoff := int64(math.MaxInt64)
-	overAge := false
-	if srv.maxAge > 0 {
-		cutoff = srv.now().Add(-srv.maxAge).Unix()
-		overAge = us.All().Count-us.ActionsLE[srv.maxAge].Count > 0
-	}
+	// When the cache is over both limits, remove over-age Actions first.
+	// Then do size-only cleanup with no age cutoff. If you use the maxAge
+	// cutoff for size-only cleanup, the cleanup can evict only Actions that
+	// are older than maxAge, and the cache can grow past maxSize without
+	// limit.
+	//
+	// overAge comes from the ActionsLE histograms, and eviction does not
+	// update them. Thus overAge can stay true until the stats loop scans
+	// the shards again (up to shardStalenessTarget), after the last
+	// over-age Actions are gone. If the age pass evicts nothing, do not
+	// trust overAge. Continue to the size pass.
+	overAge := srv.maxAge > 0 && us.All().Count-us.ActionsLE[srv.maxAge].Count > 0
 	overSize := srv.maxSize > 0 && all.Size > srv.maxSize
-	if !overAge && !overSize {
+	if overAge {
+		// maxAge cleanup runs to the count limit, because all stale
+		// Actions must go.
+		cutoff := srv.now().Add(-srv.maxAge).Unix()
+		var err error
+		ret, err = srv.evictOldestActions(ctx, cutoff, cleanupBatchSize, math.MaxInt64)
+		if err != nil || ret.Count > 0 || !overSize {
+			return ret, err
+		}
+	}
+	if !overSize {
 		return ret, nil
 	}
-	// maxAge cleanup runs to count limit (every stale Action must go);
-	// size-only cleanup runs until we've reclaimed enough bytes.
-	maxBytes := int64(math.MaxInt64)
-	if !overAge && overSize {
-		maxBytes = all.Size - srv.maxSize
-	}
-	return srv.evictOldestActions(ctx, cutoff, cleanupBatchSize, maxBytes)
+	// Size-only cleanup runs until it frees enough bytes. evictOldestActions
+	// still uses idx_actions_access (the WHERE/ORDER BY drive the plan), so
+	// the very-large cutoff means "no upper bound".
+	return srv.evictOldestActions(ctx, math.MaxInt64, cleanupBatchSize, all.Size-srv.maxSize)
 }
 
 // checkpointTruncate runs PRAGMA wal_checkpoint(TRUNCATE) and returns SQLite's
