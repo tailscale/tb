@@ -805,6 +805,111 @@ func TestCleanOldObjectsBySize(t *testing.T) {
 	}
 }
 
+// TestCleanOldObjectsBySizeWithMaxAge checks that size-based cleanup can
+// evict Actions that are younger than maxAge. The cmd/gocached binary sets a
+// maxAge by default, so this is the production configuration.
+func TestCleanOldObjectsBySizeWithMaxAge(t *testing.T) {
+	const day = 24 * time.Hour
+	st := newServerTester(t, WithMaxAge(60*day))
+
+	c1 := st.mkClient()
+	st.wantPut(c1, "0001", "9901", "1")
+	st.advanceClock(time.Second)
+	st.wantPut(c1, "0002", "9902", "22")
+	st.advanceClock(time.Second)
+	st.wantPut(c1, "0003", "9903", "333")
+	st.advanceClock(time.Second)
+	st.wantPut(c1, "0004", "9904", "4444")
+	st.advanceClock(time.Second)
+
+	if got := st.cleanOldObjects(); got != (countAndSize{}) {
+		t.Errorf("cleanOldObjects got %v, want no clean", got)
+	}
+
+	// All Actions are younger than maxAge, so only size-based cleanup
+	// applies. The only way to get to 8 bytes or less is to delete "1" and
+	// "22" (3 bytes).
+	st.srv.maxSize = 8
+	if got, want := st.cleanOldObjects(), (countAndSize{Count: 2, Size: 3}); got != want {
+		t.Errorf("cleanOldObjects got %v, want %v", got, want)
+	}
+	if got, want := st.usageStats().All(), (countAndSize{Count: 2, Size: 7}); got != want {
+		t.Errorf("usageStats: %v; want %v", got, want)
+	}
+
+	// Make "333" and "4444" older than maxAge. Then add young data so that
+	// the cache is over both limits. Age-based cleanup removes "333" and
+	// "4444" (7 bytes). The remaining 11 bytes are still more than 8, so
+	// size-based cleanup then removes "55555", which is younger than maxAge.
+	st.advanceClock(61 * day)
+	st.wantPut(c1, "0005", "9905", "55555")
+	st.advanceClock(time.Second)
+	st.wantPut(c1, "0006", "9906", "666666")
+	if got, want := st.cleanOldObjects(), (countAndSize{Count: 3, Size: 12}); got != want {
+		t.Errorf("cleanOldObjects got %v, want %v", got, want)
+	}
+	if got, want := st.usageStats().All(), (countAndSize{Count: 1, Size: 6}); got != want {
+		t.Errorf("usageStats: %v; want %v", got, want)
+	}
+}
+
+// TestCleanupBySizeWithStaleAgeStats checks that size-based cleanup runs when
+// the ActionsLE histograms still show over-age Actions that eviction has
+// already removed. The stats loop scans each shard again only after
+// shardStalenessTarget, so in production the histograms can be stale for up
+// to that duration. This test calls cleanupTick directly and does not scan
+// the shards between ticks.
+func TestCleanupBySizeWithStaleAgeStats(t *testing.T) {
+	const day = 24 * time.Hour
+	st := newServerTester(t, WithMaxAge(60*day))
+	st.srv.maxSize = 8
+	ctx := context.Background()
+
+	c1 := st.mkClient()
+	st.wantPut(c1, "0001", "9901", "1")
+	st.advanceClock(time.Second)
+	st.wantPut(c1, "0002", "9902", "22")
+	st.advanceClock(61 * day)
+	st.wantPut(c1, "0003", "9903", "333")
+	st.advanceClock(time.Second)
+	st.wantPut(c1, "0004", "9904", "4444")
+	st.advanceClock(time.Second)
+	st.wantPut(c1, "0005", "9905", "55555")
+	st.advanceClock(time.Second)
+
+	// Scan the shards one time. After this, the histograms stay as they are.
+	_ = st.usageStats()
+
+	// The first tick removes the over-age Actions "1" and "22".
+	res, err := st.srv.cleanupTick(ctx)
+	if err != nil {
+		t.Fatalf("cleanupTick: %v", err)
+	}
+	if want := (countAndSize{Count: 2, Size: 3}); res != want {
+		t.Errorf("first cleanupTick got %v, want %v", res, want)
+	}
+
+	// Make sure that the histograms are stale. If they are not, this test
+	// does not examine the stale case.
+	us := st.srv.lastUsage.Load()
+	if n := us.All().Count - us.ActionsLE[st.srv.maxAge].Count; n == 0 {
+		t.Fatalf("lastUsage shows no over-age Actions; want stale histograms")
+	}
+
+	// The cache has 12 bytes, which is more than 8. The second tick must do
+	// size-based cleanup. It removes "333" and "4444" (7 bytes).
+	res, err = st.srv.cleanupTick(ctx)
+	if err != nil {
+		t.Fatalf("cleanupTick: %v", err)
+	}
+	if want := (countAndSize{Count: 2, Size: 7}); res != want {
+		t.Errorf("second cleanupTick got %v, want %v", res, want)
+	}
+	if got, want := st.usageStats().All(), (countAndSize{Count: 1, Size: 5}); got != want {
+		t.Errorf("usageStats: %v; want %v", got, want)
+	}
+}
+
 func TestLZ4Storage(t *testing.T) {
 	st := newServerTester(t)
 	c := st.mkClient()
