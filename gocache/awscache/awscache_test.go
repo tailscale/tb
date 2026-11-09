@@ -211,6 +211,7 @@ func (env *testEnv) newCache(modify func(*Config)) *Cache {
 type client struct {
 	t  *testing.T
 	h  *Handler
+	ts *httptest.Server
 	hc *cachers.HTTPClient
 }
 
@@ -219,8 +220,9 @@ func (env *testEnv) newClient(c *Cache, g Grant) *client {
 	ts := httptest.NewServer(h)
 	env.t.Cleanup(ts.Close)
 	return &client{
-		t: env.t,
-		h: h,
+		t:  env.t,
+		h:  h,
+		ts: ts,
 		hc: &cachers.HTTPClient{
 			BaseURL: ts.URL,
 			Disk:    &cachers.DiskCache{Dir: env.t.TempDir()},
@@ -473,6 +475,8 @@ func TestDiskSpool(t *testing.T) {
 	data := randBytes(1 << 20)
 	cl.put("abab01", "0a01", data)
 	cl.wantHit("abab01", "0a01", data)
+	cl.ts.Close()
+
 	ents, err := os.ReadDir(c.cfg.SpoolDir)
 	if err != nil {
 		t.Fatal(err)
