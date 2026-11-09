@@ -1180,6 +1180,9 @@ type Server struct {
 		PutQueueBlockedSpoolBytes expvar.Int `type:"counter" name:"put_queue_blocked_spool_bytes" help:"PUT requests that waited on the spooled lane's byte cap; raise the spool capacity if the disk has room, or look at the movers if pending never drains"`
 		PutQueueBlockedSpoolCount expvar.Int `type:"counter" name:"put_queue_blocked_spool_count" help:"PUT requests that waited on the spooled lane's count cap; many small blobs are piling up faster than the movers copy them"`
 		PutQueueCopyErrs          expvar.Int `type:"counter" name:"put_queue_copy_errs" help:"failed attempts to copy a spooled blob into the main blob directory; retried before the PUT is dropped"`
+		PutExisting               expvar.Int `type:"counter" name:"put_existing" help:"PUTs of blobs already in the hot tier, whose bodies were only hashed to verify them rather than spooled, compressed, and copied into the main blob directory"`
+		PutExistingMismatches     expvar.Int `type:"counter" name:"put_existing_mismatches" help:"PUTs whose outputID named a blob in the hot tier but whose body hashed to something else; the body was discarded and nothing stored, though the client was told success"`
+		PutExistingGone           expvar.Int `type:"counter" name:"put_existing_gone" help:"PUTs of already-stored blobs (see put_existing) dropped at metadata commit because the blob had been evicted, or its size no longer matched, since the PUT arrived; the blob is also dropped from the hot tier so the next PUT of it stores it again"`
 		PutQueueCopySkips         expvar.Int `type:"counter" name:"put_queue_copy_skips" help:"spooled blobs already present in the main blob directory with the expected size, so neither copied nor given a cleanup intent; a subset of gocached_put_queue_copy_duration_seconds_count"`
 		PutQueueDropped           expvar.Int `type:"counter" name:"put_queue_dropped" help:"pending PUTs abandoned after repeated copy or flush failures; the client saw success but the object was lost"`
 		PutQueueFlushes           expvar.Int `type:"counter" name:"put_queue_flushes" help:"metadata batch transactions committed by the put-queue flusher"`
@@ -1550,8 +1553,20 @@ func (srv *Server) handleGetAction(w http.ResponseWriter, r *http.Request, stats
 		// was retired between the lookup and now, its file is gone but its
 		// metadata is committed, so fall through to the SQL path below.
 		var rc io.ReadCloser
+		fromHot := false
 		ok := true
-		if pp.smallData == nil {
+		switch {
+		case pp.smallData != nil:
+		case pp.existing:
+			// The entry has no bytes of its own; serve the stored blob it
+			// matched. If that's gone too, the SQL path below decides.
+			f, hot, err := srv.getObjectFromDiskOrPeer(ctx, pp.sha256hex, pp.storedSize != pp.uncompressedSize)
+			if err != nil || f == nil {
+				ok = false
+			} else {
+				rc, fromHot = f, hot
+			}
+		default:
 			f, err := os.Open(pp.queueFile)
 			if err != nil {
 				ok = false
@@ -1576,7 +1591,7 @@ func (srv *Server) handleGetAction(w http.ResponseWriter, r *http.Request, stats
 				smallData:        pp.smallData,
 				open: func() (io.ReadCloser, bool, error) {
 					opened = true
-					return rc, false, nil
+					return rc, fromHot, nil
 				},
 			})
 			labels.markPending()
@@ -2121,10 +2136,29 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, stats *stats,
 		}
 	}
 
+	// A blob already in the hot tier, which most spooled-size PUTs turn
+	// out to be, needn't be stored again: its body is only hashed, to
+	// verify it is the blob outputID names, and the PUT then waits only for
+	// its metadata to commit, in the inline lane. That skips the lz4
+	// compression and spooling that dominate PUT CPU, and the copy into the
+	// main blob directory. Blobs on disk but not hot take the normal path,
+	// which installs them in the hot tier, so their next PUT is fast.
+	var existingSize int64
+	existing := false
+	if s.hot != nil && r.ContentLength > smallObjectSize {
+		existingSize, existing = s.hot.use(blobFileName(outputID, r.ContentLength))
+	}
+
 	// Backpressure: reserve queue room for the declared size before reading
 	// any of the body. This blocks when the background pipeline is behind,
 	// and aborts if the client goes away while waiting.
-	reserved, err := s.putq.reserve(r.Context(), r.ContentLength)
+	var reserved putReservation
+	var err error
+	if existing {
+		reserved, err = s.putq.reserveInlineLane(r.Context())
+	} else {
+		reserved, err = s.putq.reserve(r.Context(), r.ContentLength)
+	}
 	if err != nil {
 		stats.PutErrs++
 		http.Error(w, "canceled while awaiting queue room", http.StatusServiceUnavailable)
@@ -2175,6 +2209,22 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, stats *stats,
 			http.Error(w, "bad content length", http.StatusInternalServerError)
 			return
 		}
+	} else if existing {
+		n, err := io.Copy(io.Discard, io.LimitReader(hashingBody, r.ContentLength+1))
+		if err != nil {
+			if r.Context().Err() == nil {
+				s.logf("Read content error: %v", err)
+			}
+			stats.PutErrs++
+			http.Error(w, "Read content error", http.StatusInternalServerError)
+			return
+		}
+		if n != r.ContentLength {
+			stats.PutErrs++
+			http.Error(w, "bad content length", http.StatusInternalServerError)
+			return
+		}
+		storedSize = existingSize
 	} else {
 		// Larger objects are spooled (lz4 compressed) to the put-queue
 		// directory on the local disk; the background movers copy them
@@ -2191,6 +2241,21 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, stats *stats,
 	}
 
 	sha256hex := fmt.Sprintf("%x", hasher.Sum(nil))
+	if existing && sha256hex != outputID {
+		// The body isn't the hot blob that outputID named, and it has been
+		// read and discarded, so there is nothing to store. A cache may
+		// always decline a PUT, so for now report success and count it.
+		//
+		// TODO(bradfitz): return a 500 once metrics confirm this is as rare
+		// as expected: it requires a client whose outputID isn't the hash
+		// of what it sent and yet is the hash of a blob held here.
+		s.logf("put of %v: outputID names a hot blob but the body hashes to %v; not stored", outputID, sha256hex)
+		s.m.PutExistingMismatches.Add(1)
+		storage = "existing"
+		result = "mismatch"
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
 
 	altOutputID := ""
 	if sha256hex != outputID {
@@ -2206,6 +2271,7 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, stats *stats,
 		smallData:        smallData,
 		queueFile:        queueFile,
 		reservation:      reserved,
+		existing:         existing,
 	}
 
 	if s.putq.enqueue(p) {
@@ -2225,10 +2291,14 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, stats *stats,
 
 	stats.Puts++
 	stats.PutsBytes += r.ContentLength
-	if smallData != nil {
+	switch {
+	case smallData != nil:
 		stats.PutsInline++
 		storage = "inline"
-	} else {
+	case existing:
+		s.m.PutExisting.Add(1)
+		storage = "existing"
+	default:
 		storage = "disk"
 	}
 	s.blobSize.WithLabelValues(storage, result).Observe(float64(r.ContentLength))

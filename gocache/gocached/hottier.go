@@ -79,6 +79,19 @@ func (h *hotIndex) touch(name string) {
 	}
 }
 
+// use reports the size of name if it's in the index, marking it most
+// recently used.
+func (h *hotIndex) use(name string) (size int64, ok bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	e, ok := h.ents[name]
+	if !ok {
+		return 0, false
+	}
+	h.ll.MoveToFront(e)
+	return e.Value.(*hotEntry).size, true
+}
+
 // add records that name (of the given size) is now resident in the hot tier,
 // marking it most recently used. Adding an existing name updates its size.
 func (h *hotIndex) add(name string, size int64) {
