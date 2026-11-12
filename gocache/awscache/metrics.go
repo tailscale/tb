@@ -23,6 +23,7 @@ type metrics struct {
 	activeGets      prometheus.Gauge
 	activePuts      prometheus.Gauge
 	danglingActions prometheus.Counter
+	midUnavailable  prometheus.Counter
 	corruptBlobs    prometheus.Counter
 	blobUploads     prometheus.Counter
 	blobUploadBytes prometheus.Counter
@@ -46,37 +47,38 @@ func newMetrics() *metrics {
 	return &metrics{
 		opDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Name:    "gocache_aws_op_duration_seconds",
-			Help:    "latency of S3 and DynamoDB calls (to first byte, for S3 GETs), labeled by service (dynamodb, s3, or s3express for a directory bucket), op, and result (ok, miss, cond for a failed condition, or error)",
+			Help:    "latency of S3 and DynamoDB calls (to first byte, for S3 GETs), labeled by service (dynamodb, s3, or s3express or s3mid for the mid-size bucket), op, and result (ok, miss, cond for a failed condition, or error)",
 			Buckets: latencyBuckets,
 		}, []string{"service", "op", "result"}),
 		getDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Name:    "gocache_aws_get_duration_seconds",
-			Help:    "wall time of each cache get, labeled by storage (inline, s3, or none) and type (hit, miss, or error)",
+			Help:    "wall time of each cache get, labeled by storage (inline, s3, mid, or none) and type (hit, miss, or error)",
 			Buckets: latencyBuckets,
 		}, []string{"storage", "type"}),
 		putDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Name:    "gocache_aws_put_duration_seconds",
-			Help:    "wall time of each cache put, labeled by storage (inline, s3, dup, or none) and type (put, dup, or error)",
+			Help:    "wall time of each cache put, labeled by storage (inline, s3, mid, dup, or none) and type (put, dup, or error)",
 			Buckets: latencyBuckets,
 		}, []string{"storage", "type"}),
 		getPhase: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Name:    "gocache_aws_get_phase_duration_seconds",
-			Help:    "time spent in each phase of a cache get served by the HTTP handler, labeled by tier (inline, s3, miss, or error) and phase (lookup: the DynamoDB action lookup; first_byte: the blob GET to its response headers; transfer: sending the response body, which for a blob streams it from S3). Phases that didn't happen aren't observed",
+			Help:    "time spent in each phase of a cache get served by the HTTP handler, labeled by tier (inline, s3, mid, miss, or error) and phase (lookup: the DynamoDB action lookup; first_byte: the blob GET to its response headers; transfer: sending the response body, which for a blob streams it from S3). Phases that didn't happen aren't observed",
 			Buckets: phaseBuckets,
 		}, []string{"tier", "phase"}),
 		putPhase: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Name:    "gocache_aws_put_phase_duration_seconds",
-			Help:    "time spent in each phase of a cache put served by the HTTP handler, labeled by tier (inline, s3, dup, or error) and phase (exists: the DynamoDB check for an existing action; spool_wait: waiting for buffer space; receive: reading the body, and hashing and compressing blobs; blob_check: checking whether the blob is already stored; upload: uploading the blob; meta: writing the action item). Phases that didn't happen aren't observed",
+			Help:    "time spent in each phase of a cache put served by the HTTP handler, labeled by tier (inline, s3, mid, dup, or error) and phase (exists: the DynamoDB check for an existing action; spool_wait: waiting for buffer space; receive: reading the body, and hashing and compressing blobs; blob_check: checking whether the blob is already stored; upload: uploading the blob; meta: writing the action item). Phases that didn't happen aren't observed",
 			Buckets: phaseBuckets,
 		}, []string{"tier", "phase"}),
 		blobBytes: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "gocache_aws_blob_bytes_total",
-			Help: "blob (lz4) bytes read from S3 by gets and uploaded to S3 by puts served by the HTTP handler, labeled by op (get or put) and tier (s3, or error for gets that failed while streaming a blob). With the transfer and upload phases, gives throughput",
+			Help: "blob (lz4) bytes read from S3 by gets and uploaded to S3 by puts served by the HTTP handler, labeled by op (get or put) and tier (s3 or mid, or miss or error for gets that failed after reading a blob). With the transfer and upload phases, gives throughput",
 		}, []string{"op", "tier"}),
 		objectBytes: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Name: "gocache_aws_object_bytes",
 			Help: "uncompressed sizes of objects returned by get hits and stored by puts, labeled by op",
-			// 64B to 2GiB, doubling.
+			// 64B to 2GiB, doubling, so that 512KiB and 4MiB (candidate
+			// MidMax values) are bucket bounds.
 			Buckets: prometheus.ExponentialBuckets(64, 2, 26),
 		}, []string{"op"}),
 		activeGets: prometheus.NewGauge(prometheus.GaugeOpts{
@@ -90,6 +92,10 @@ func newMetrics() *metrics {
 		danglingActions: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "gocache_aws_dangling_actions_total",
 			Help: "gets whose action referenced a blob missing from S3 (e.g. deleted by the scrubber), served as misses",
+		}),
+		midUnavailable: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "gocache_aws_mid_unavailable_total",
+			Help: "gets whose action referenced a blob in the mid-size bucket when this cache has none configured, served as misses",
 		}),
 		corruptBlobs: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "gocache_aws_corrupt_blobs_total",
@@ -138,7 +144,7 @@ func (m *metrics) collectors() []prometheus.Collector {
 	return []prometheus.Collector{
 		m.opDuration, m.getDuration, m.putDuration, m.getPhase, m.putPhase,
 		m.blobBytes, m.objectBytes,
-		m.activeGets, m.activePuts, m.danglingActions, m.corruptBlobs,
+		m.activeGets, m.activePuts, m.danglingActions, m.midUnavailable, m.corruptBlobs,
 		m.blobUploads, m.blobUploadBytes, m.blobSkips, m.spoolBytes,
 		m.spoolBlocked, m.atimeQueued, m.atimeDropped, m.atimeBumps,
 		m.atimeErrs,

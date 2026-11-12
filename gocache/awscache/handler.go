@@ -64,11 +64,13 @@ type Stats struct {
 	PutsNanos      int64
 
 	// GetTiers breaks gets down by where they were served from: "inline"
-	// (from DynamoDB), "s3", "miss", or "error".
+	// (from DynamoDB), "s3", "mid" (the mid-size bucket), "miss", or
+	// "error".
 	GetTiers map[string]GetTierStats `json:",omitempty"`
 
 	// PutTiers breaks puts down by where they stored the object: "inline",
-	// "s3", "dup" (already stored, so not stored again), or "error".
+	// "s3", "mid", "dup" (already stored, so not stored again), or
+	// "error".
 	PutTiers map[string]PutTierStats `json:",omitempty"`
 }
 

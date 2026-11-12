@@ -17,7 +17,8 @@ import (
 // $AWSCACHE_TEST_TABLE and $AWSCACHE_TEST_BUCKET, with credentials and
 // region from the environment as usual. It's skipped without them. If
 // $AWSCACHE_TEST_EXPRESS_BUCKET is also set, it runs again with that S3
-// Express One Zone directory bucket as the bucket.
+// Express One Zone directory bucket as the bucket, and again with it as the
+// mid-size bucket.
 //
 // The lab environment in lab/ provides all of these.
 func TestRealAWS(t *testing.T) {
@@ -25,22 +26,22 @@ func TestRealAWS(t *testing.T) {
 	if table == "" || bucket == "" {
 		t.Skip("AWSCACHE_TEST_TABLE and AWSCACHE_TEST_BUCKET not set")
 	}
-	buckets := []string{bucket}
-	if b := os.Getenv("AWSCACHE_TEST_EXPRESS_BUCKET"); b != "" {
-		buckets = append(buckets, b)
-	}
-	for _, bucket := range buckets {
-		t.Run(bucket, func(t *testing.T) { testRealAWS(t, table, bucket) })
+	t.Run(bucket, func(t *testing.T) { testRealAWS(t, table, bucket, "", 0) })
+	if express := os.Getenv("AWSCACHE_TEST_EXPRESS_BUCKET"); express != "" {
+		t.Run(express, func(t *testing.T) { testRealAWS(t, table, express, "", 0) })
+		t.Run("mid", func(t *testing.T) { testRealAWS(t, table, bucket, express, 512<<10) })
 	}
 }
 
-func testRealAWS(t *testing.T, table, bucket string) {
+func testRealAWS(t *testing.T, table, bucket, midBucket string, midMax int64) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
 	c, err := New(ctx, Config{
 		Region:     os.Getenv("AWS_REGION"),
 		Table:      table,
 		Bucket:     bucket,
+		MidBucket:  midBucket,
+		MidMax:     midMax,
 		BlobPrefix: "awscache-test/",
 		Logf:       t.Logf,
 		Retention:  2 * 24 * time.Hour, // let test items expire soon
@@ -57,8 +58,11 @@ func testRealAWS(t *testing.T, table, bucket string) {
 	g := Grant{CanWrite: true, WriteNamespace: ns, ExtraReadNamespace: ns}
 	for _, size := range []int{0, 10, 100 << 10, 1 << 20} {
 		wantStorage := "s3"
-		if size <= 700 {
+		switch {
+		case size <= 700:
 			wantStorage = "inline"
+		case int64(size) <= midMax:
+			wantStorage = "mid"
 		}
 		id := make([]byte, 32)
 		rand.Read(id)
