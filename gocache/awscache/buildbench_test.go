@@ -19,12 +19,15 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"text/tabwriter"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
 	"github.com/tailscale/tb/gocache/cacheproc"
@@ -93,7 +96,7 @@ func TestBuildBench(t *testing.T) {
 		if cfg.express {
 			bkt = expressBucket
 		}
-		c, err := New(ctx, Config{
+		ccfg := Config{
 			Region:           region,
 			Table:            table,
 			Bucket:           bkt,
@@ -101,7 +104,18 @@ func TestBuildBench(t *testing.T) {
 			GlobalGeneration: gen,
 			Retention:        2 * 24 * time.Hour, // let bench items expire soon
 			Logf:             t.Logf,
-		})
+		}
+		if cfg.pod {
+			// The stores Config would make, but with blobs in gocached.
+			awsCfg, err := loadAWSConfig(ctx, region)
+			if err != nil {
+				return nil, err
+			}
+			m := newMetrics() // the stores' own; not reported
+			ccfg.meta = &dynamoStore{c: dynamodb.NewFromConfig(awsCfg), table: table, m: m}
+			ccfg.blobs = newPodBlobStore(*buildBenchGocached, &s3Store{c: s3.NewFromConfig(awsCfg), bucket: bucket, service: "s3", m: m})
+		}
+		c, err := New(ctx, ccfg)
 		if err != nil {
 			return nil, err
 		}
@@ -156,9 +170,14 @@ func TestBuildBench(t *testing.T) {
 		}
 	}
 
+	b.gocachedURL = *buildBenchGocached
 	configs = slices.DeleteFunc(configs, func(cfg benchConfig) bool {
-		if cfg.express && expressBucket == "" {
+		switch {
+		case cfg.express && expressBucket == "":
 			t.Logf("skipping config %s: AWSCACHE_TEST_EXPRESS_BUCKET not set", cfg.name)
+			return true
+		case (cfg.gocached || cfg.pod) && b.gocachedURL == "":
+			t.Logf("skipping config %s: -buildbench.gocached not set", cfg.name)
 			return true
 		}
 		return false
@@ -205,6 +224,8 @@ var (
 	buildBenchOut       = flag.String("buildbench.out", "", "if non-empty, a file to append results to as JSON lines")
 	buildBenchTailscale = flag.String("buildbench.tailscale", os.Getenv("AWSCACHE_BENCH_TAILSCALE_DIR"),
 		"checkout of github.com/tailscale/tailscale, for the cases that build Tailscale; default $AWSCACHE_BENCH_TAILSCALE_DIR")
+	buildBenchGocached = flag.String("buildbench.gocached", os.Getenv("AWSCACHE_BENCH_GOCACHED_URL"),
+		"base URL of a gocached server without auth, for the gocached and ddbgocached configs; default $AWSCACHE_BENCH_GOCACHED_URL")
 )
 
 // benchCase is a go command whose build time TestBuildBench measures.
@@ -254,6 +275,17 @@ type benchConfig struct {
 	name    string
 	index   int  // added to the generation, so each config has its own cache
 	express bool // blobs in $AWSCACHE_TEST_EXPRESS_BUCKET, not $AWSCACHE_TEST_BUCKET
+
+	// gocached is whether the GOCACHEPROG talks to the gocached server at
+	// -buildbench.gocached directly, with no Cache: the design of today's
+	// cigocached.
+	gocached bool
+
+	// pod is whether the Cache keeps blobs in the gocached server at
+	// -buildbench.gocached, in front of $AWSCACHE_TEST_BUCKET, with
+	// metadata in DynamoDB as usual: a simulation of the NVMe cache pod
+	// design, with one pod. See [podBlobStore].
+	pod bool
 }
 
 func (c benchConfig) itemName() string { return c.name }
@@ -261,6 +293,8 @@ func (c benchConfig) itemName() string { return c.name }
 var benchConfigs = []benchConfig{
 	{name: "s3", index: 0},                     // S3 Standard
 	{name: "express", index: 1, express: true}, // S3 Express One Zone
+	{name: "gocached", index: 2, gocached: true},
+	{name: "ddbgocached", index: 3, pod: true},
 }
 
 type benchItem interface{ itemName() string }
@@ -291,11 +325,12 @@ func selectBenchItems[T benchItem](items []T, list string) ([]T, error) {
 }
 
 type buildBencher struct {
-	t        *testing.T
-	newCache func(_ context.Context, _ benchConfig, gen int) (*Cache, error)
-	exe      string // this test binary, which is also the GOCACHEPROG
-	modRoot  string
-	out      *json.Encoder // or nil
+	t           *testing.T
+	newCache    func(_ context.Context, _ benchConfig, gen int) (*Cache, error)
+	gocachedURL string // for configs that use gocached
+	exe         string // this test binary, which is also the GOCACHEPROG
+	modRoot     string
+	out         *json.Encoder // or nil
 
 	results []benchResult
 }
@@ -369,6 +404,12 @@ func (h sizeHist) count(lo, hi int64) int64 {
 		}
 	}
 	return n
+}
+
+// misses returns how many of r's gets missed in both the local and the
+// remote cache.
+func (r *benchResult) misses() int64 {
+	return r.Gets - r.LocalHits - r.RemoteHits - r.RemoteErrs
 }
 
 // getTier returns r's stats of gets from tier.
@@ -462,23 +503,38 @@ func (b *buildBencher) run(bc benchCase, cfg benchConfig, gen int, runName strin
 	var h *Handler
 	statsFile := filepath.Join(dir, "cacheprog-stats.json")
 	if cfg != noRemote {
-		c, err = b.newCache(ctx, cfg, gen)
-		if err != nil {
-			t.Fatal(err)
+		var url, salt string
+		if cfg.gocached {
+			// No Cache: the GOCACHEPROG talks to gocached directly. Salting
+			// its action IDs with the generation gives each config of each
+			// run an empty cache in gocached's one global namespace.
+			if b.gocachedURL == "" {
+				t.Fatalf("config %s needs -buildbench.gocached", cfg.name)
+			}
+			url, salt = b.gocachedURL, strconv.Itoa(gen)
+		} else {
+			c, err = b.newCache(ctx, cfg, gen)
+			if err != nil {
+				t.Fatal(err)
+			}
+			h = c.NewHandler(func(*http.Request) Grant { return Grant{CanWrite: true} })
+			ts := httptest.NewServer(h)
+			defer func() {
+				ts.Close()
+				c.Close(ctx)
+			}()
+			url = ts.URL
 		}
-		h = c.NewHandler(func(*http.Request) Grant { return Grant{CanWrite: true} })
-		ts := httptest.NewServer(h)
-		args := []string{b.exe, cacheprogArg, ts.URL, dirs.progDisk, statsFile}
+		args := []string{b.exe, cacheprogArg, url, dirs.progDisk, statsFile}
+		if salt != "" {
+			args = append(args, salt)
+		}
 		for _, a := range args {
 			if strings.ContainsAny(a, " \t'\"") {
 				t.Fatalf("GOCACHEPROG argument %q has spaces or quotes", a)
 			}
 		}
 		cmd.Env = append(cmd.Env, "GOCACHEPROG="+strings.Join(args, " "))
-		defer func() {
-			ts.Close()
-			c.Close(ctx)
-		}()
 	}
 
 	start := time.Now()
@@ -491,7 +547,7 @@ func (b *buildBencher) run(bc benchCase, cfg benchConfig, gen int, runName strin
 		res.Err = err.Error()
 	}
 
-	if c != nil {
+	if cfg != noRemote {
 		var ps cacheprogStats
 		if j, err := os.ReadFile(statsFile); err != nil {
 			t.Errorf("reading GOCACHEPROG stats: %v", err)
@@ -504,6 +560,8 @@ func (b *buildBencher) run(bc benchCase, cfg benchConfig, gen int, runName strin
 		if !ps.Drained {
 			t.Errorf("%s/%s/%s: background PUTs didn't drain", bc.name, cfg.name, runName)
 		}
+	}
+	if c != nil {
 		st := h.Stats()
 		res.Stats = &st
 		b.addCacheMetrics(&res, c)
@@ -512,7 +570,7 @@ func (b *buildBencher) run(bc benchCase, cfg benchConfig, gen int, runName strin
 	b.results = append(b.results, res)
 	t.Logf("%s/%s/%s: %.1fs (drain %.1fs); gets %d, local hits %d, remote hits %d (inline %d, s3 %d), misses %d; puts %d",
 		bc.name, cfg.name, runName, res.WallSecs, res.DrainSecs, res.Gets, res.LocalHits, res.RemoteHits,
-		res.getTier("inline").Gets, res.getTier("s3").Gets, res.getTier("miss").Gets, res.Puts)
+		res.getTier("inline").Gets, res.getTier("s3").Gets, res.misses(), res.Puts)
 	if b.out != nil {
 		if err := b.out.Encode(res); err != nil {
 			t.Error(err)
@@ -632,7 +690,7 @@ func (b *buildBencher) printSummary() {
 		}
 		fmt.Fprintf(tw, "%s\t%s\t%s\t%.1f\t%.1f\t%d\t%d\t%d\t%d\t%d\t%d\t%s\t%s\t%s\t\n",
 			r.Case, r.Config, r.Run, r.WallSecs, r.DrainSecs, r.Gets, r.LocalHits,
-			r.getTier("inline").Gets, r.getTier("s3").Gets, r.getTier("miss").Gets, uploads,
+			r.getTier("inline").Gets, r.getTier("s3").Gets, r.misses(), uploads,
 			ms(r.getPhase("s3", "lookup")), ms(r.getPhase("s3", "first_byte")), ms(r.getPhase("s3", "transfer")))
 	}
 	tw.Flush()
@@ -765,8 +823,12 @@ func TestBuildBenchFake(t *testing.T) {
 const cacheprogArg = "-awscache-buildbench-cacheprog"
 
 func TestMain(m *testing.M) {
-	if len(os.Args) == 5 && os.Args[1] == cacheprogArg {
-		os.Exit(runBenchCacheprog(os.Args[2], os.Args[3], os.Args[4]))
+	if (len(os.Args) == 5 || len(os.Args) == 6) && os.Args[1] == cacheprogArg {
+		var salt string
+		if len(os.Args) == 6 {
+			salt = os.Args[5]
+		}
+		os.Exit(runBenchCacheprog(os.Args[2], os.Args[3], os.Args[4], salt))
 	}
 	os.Exit(m.Run())
 }
@@ -784,8 +846,9 @@ type cacheprogStats struct {
 // cigocacher: a local disk cache in dir, then the HTTP cache at url, with
 // PUTs to the HTTP cache in the background. Unlike cigocacher, it waits for
 // all background PUTs at exit, so the next build finds them. It writes
-// [cacheprogStats] to statsFile at exit.
-func runBenchCacheprog(url, dir, statsFile string) int {
+// [cacheprogStats] to statsFile at exit. If salt is non-empty, it salts the
+// action IDs it sends to the HTTP cache (see [saltTransport]).
+func runBenchCacheprog(url, dir, statsFile, salt string) int {
 	disk := &cachers.DiskCache{Dir: dir}
 	remote := &cachers.HTTPClient{
 		BaseURL:               url,
@@ -793,6 +856,13 @@ func runBenchCacheprog(url, dir, statsFile string) int {
 		BestEffortHTTP:        true,
 		AsyncPutTimeout:       benchAsyncPutTimeout,
 		AsyncPutMaxConcurrent: 10, // as in cigocacher
+	}
+	if salt != "" {
+		// A remote server across the network, as ciguestlet's proxy to
+		// cigocached is: keep connections to it open, as that proxy does.
+		tr := http.DefaultTransport.(*http.Transport).Clone()
+		tr.MaxIdleConnsPerHost = 256
+		remote.HTTPClient = &http.Client{Transport: saltTransport{salt: salt, rt: tr}}
 	}
 	var gets, localHits, remoteHits, remoteErrs, puts atomic.Int64
 	p := &cacheproc.Process{

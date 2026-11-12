@@ -1,0 +1,49 @@
+#!/bin/bash
+# Sets up the lab's gocached VM: Go, gocached built from this repo, and a
+# systemd service that runs it with its cache on the instance-store NVMe.
+set -euxo pipefail
+
+dnf install -y git tar xfsprogs
+
+curl -fsSL "https://go.dev/dl/go${go_version}.linux-amd64.tar.gz" | tar -C /usr/local -xz
+
+sudo -iu ec2-user git clone --branch "${repo_branch}" "${repo_url}" tb ||
+  sudo -iu ec2-user git clone "${repo_url}" tb
+sudo -iu ec2-user bash -c 'cd tb && /usr/local/go/bin/go build -o /tmp/gocached ./cmd/gocached'
+install -m 0755 /tmp/gocached /usr/local/bin/gocached
+
+# Instance-store NVMe is empty after every stop and start, so format and
+# mount it before each start of gocached, rather than once here. Refuse to
+# start without it, rather than put the cache on the EBS root volume.
+cat >/usr/local/bin/gocached-nvme <<'SCRIPT'
+#!/bin/bash
+set -euxo pipefail
+if ! mountpoint -q /mnt/nvme; then
+  dev=$(ls /dev/disk/by-id/nvme-Amazon_EC2_NVMe_Instance_Storage_* | grep -v -- '-ns-\|-part' | head -1)
+  mkfs.xfs -f "$dev"
+  mkdir -p /mnt/nvme
+  mount -o noatime "$dev" /mnt/nvme
+fi
+mkdir -p /mnt/nvme/gocached
+SCRIPT
+chmod 0755 /usr/local/bin/gocached-nvme
+
+# No auth (no --jwt-issuer): the security group admits only the benchmark
+# VM. --debug-listen serves /metrics.
+cat >/etc/systemd/system/gocached.service <<'UNIT'
+[Unit]
+Description=gocached
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStartPre=/usr/local/bin/gocached-nvme
+ExecStart=/usr/local/bin/gocached --cache-dir=/mnt/nvme/gocached --listen=:31364 --debug-listen=:31365 --max-size-gb=${max_size_gb} --max-age-days=0
+Restart=always
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+systemctl daemon-reload
+systemctl enable --now gocached
