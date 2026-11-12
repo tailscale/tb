@@ -91,9 +91,6 @@ type blobStore interface {
 // Item key prefixes in the single DynamoDB table. The separator '#' and the
 // '!' that starts global namespace names are outside the namespace character
 // set (see [ValidateNamespace]), so keys can't collide.
-//
-// TODO(bradfitz): "m#cache#<az>" items listing the members of the optional
-// read-through NVMe blob cache pool, per ci/doc/aws-native-gocached.md.
 const actionKeyPrefix = "a#"
 
 // storageNS is a namespace name as used in storage keys: either a validated
@@ -343,6 +340,9 @@ type s3Store struct {
 	c      *s3.Client
 	bucket string
 	m      *metrics
+
+	// service is the service name in metrics, from [s3Service].
+	service string
 }
 
 var _ blobStore = (*s3Store)(nil)
@@ -374,7 +374,7 @@ func (s *s3Store) checkBucket(ctx context.Context) error {
 func (s *s3Store) Exists(ctx context.Context, key string) (_ bool, retErr error) {
 	start := time.Now()
 	result := "ok"
-	defer func() { s.m.observeOp("s3", "HeadObject", cmpResult(result, retErr), start) }()
+	defer func() { s.m.observeOp(s.service, "HeadObject", cmpResult(result, retErr), start) }()
 	_, err := s.c.HeadObject(ctx, &s3.HeadObjectInput{Bucket: &s.bucket, Key: &key})
 	if err != nil {
 		var nf *s3types.NotFound
@@ -390,7 +390,7 @@ func (s *s3Store) Exists(ctx context.Context, key string) (_ bool, retErr error)
 func (s *s3Store) Put(ctx context.Context, key string, r io.ReadSeeker, size int64) (retErr error) {
 	start := time.Now()
 	result := "ok"
-	defer func() { s.m.observeOp("s3", "PutObject", cmpResult(result, retErr), start) }()
+	defer func() { s.m.observeOp(s.service, "PutObject", cmpResult(result, retErr), start) }()
 	_, err := s.c.PutObject(ctx, &s3.PutObjectInput{
 		Bucket:        &s.bucket,
 		Key:           &key,
@@ -415,7 +415,7 @@ func (s *s3Store) Get(ctx context.Context, key string) (_ io.ReadCloser, size in
 	start := time.Now()
 	result := "ok"
 	// This measures time to first byte; the body streams afterwards.
-	defer func() { s.m.observeOp("s3", "GetObject", cmpResult(result, retErr), start) }()
+	defer func() { s.m.observeOp(s.service, "GetObject", cmpResult(result, retErr), start) }()
 	out, err := s.c.GetObject(ctx, &s3.GetObjectInput{Bucket: &s.bucket, Key: &key})
 	if err != nil {
 		var nsk *s3types.NoSuchKey

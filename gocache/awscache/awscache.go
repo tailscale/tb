@@ -228,12 +228,6 @@ type Config struct {
 	// loading the default one.
 	AWSConfig *aws.Config
 
-	// TODO(bradfitz): optional same-AZ read-through NVMe blob cache tier
-	// (stateless pods on EKS, discovered via "m#cache#<az>" DynamoDB items
-	// and sharded by rendezvous hashing of the blob SHA-256), per the "Cache
-	// tier" section of ci/doc/aws-native-gocached.md. It's purely a latency
-	// optimization; everything here works against S3 alone.
-
 	// Test hooks, replacing the AWS clients and clock.
 	meta  metaStore
 	blobs blobStore
@@ -289,7 +283,9 @@ func New(ctx context.Context, cfg Config) (*Cache, error) {
 			}
 		}
 		ddb := &dynamoStore{c: dynamodb.NewFromConfig(awsCfg), table: cfg.Table, consistentReads: cfg.ConsistentReads, m: m}
-		bs := &s3Store{c: s3.NewFromConfig(awsCfg), bucket: cfg.Bucket, m: m}
+		// The S3 client finds directory buckets by their "--x-s3" suffix
+		// and handles their session authentication itself.
+		bs := &s3Store{c: s3.NewFromConfig(awsCfg), bucket: cfg.Bucket, service: s3Service(cfg.Bucket), m: m}
 		cfg.meta, cfg.blobs = ddb, bs
 		checks = append(checks, ddb.checkTable, bs.checkBucket)
 	}
@@ -627,19 +623,30 @@ var ErrBadID = errors.New("awscache: malformed action or output ID")
 // on a miss. A hit's bytes stream from storage as they're written, and
 // are checked on the way.
 func (c *Cache) Get(ctx context.Context, g Grant, actionID string) (*Object, error) {
-	o, _, err := c.get(ctx, g, actionID)
+	o, _, err := c.get(ctx, g, actionID, new(getTiming))
 	return o, err
 }
 
-// get is Get, also reporting whether a hit enqueued an access time bump.
-func (c *Cache) get(ctx context.Context, g Grant, actionID string) (_ *Object, bumped bool, _ error) {
+// getTiming is how long the phases of one get took in [Cache.get]. A phase
+// that didn't happen has a zero duration. The blob's body streams after
+// get returns, so the caller times that.
+type getTiming struct {
+	lookup    time.Duration // DynamoDB lookup of the action, in every namespace read
+	firstByte time.Duration // blob GET, to its response headers
+}
+
+// get is Get, also reporting whether a hit enqueued an access time bump,
+// and filling in tm.
+func (c *Cache) get(ctx context.Context, g Grant, actionID string, tm *getTiming) (_ *Object, bumped bool, _ error) {
 	if !validHex(actionID) {
 		return nil, false, ErrBadID
 	}
 	if err := g.validate(); err != nil {
 		return nil, false, err
 	}
+	start := time.Now()
 	key, e, err := c.lookupAction(ctx, g, actionID)
+	tm.lookup = time.Since(start)
 	if err != nil || e == nil {
 		return nil, false, err
 	}
@@ -657,7 +664,7 @@ func (c *Cache) get(ctx context.Context, g Grant, actionID string) (_ *Object, b
 		c.m.corruptBlobs.Inc()
 		return nil, false, nil
 	}
-	blob, err := c.openBlob(ctx, key, e)
+	blob, err := c.openBlob(ctx, key, e, tm)
 	if err != nil || blob == nil {
 		return nil, false, err
 	}
@@ -706,12 +713,12 @@ func (c *Cache) lookupAction(ctx context.Context, g Grant, actionID string) (key
 }
 
 // openBlob opens the blob of the non-inline action e (at key). It returns
-// (nil, nil) if the blob is missing or isn't the size e says.
-func (c *Cache) openBlob(ctx context.Context, key string, e *actionEntry) (io.ReadCloser, error) {
-	// TODO(bradfitz): first try the optional same-AZ read-through NVMe
-	// cache pool (see Config), hedging to S3 directly if the pool doesn't
-	// start answering quickly. Until then, every blob GET goes to S3.
+// (nil, nil) if the blob is missing or isn't the size e says. It fills in
+// tm's first byte time.
+func (c *Cache) openBlob(ctx context.Context, key string, e *actionEntry, tm *getTiming) (io.ReadCloser, error) {
+	start := time.Now()
 	rc, size, err := c.blobs.Get(ctx, blobKey(c.cfg.BlobPrefix, e.SHA256))
+	tm.firstByte = time.Since(start)
 	if errors.Is(err, errBlobNotFound) {
 		// PUT writes the blob before the action, so this means the
 		// scrubber deleted the blob after this action's last use. Treat it
@@ -742,6 +749,15 @@ type putResult struct {
 	created bool   // false if the action already existed
 }
 
+// s3Service returns the metrics service name of bucket: "s3express" for a
+// directory bucket, else "s3".
+func s3Service(bucket string) string {
+	if strings.HasSuffix(bucket, "--x-s3") {
+		return "s3express"
+	}
+	return "s3"
+}
+
 // Put stores the size-byte object read from body as the output outputID of
 // actionID in g's write namespace, unless that namespace already has an
 // entry for actionID (the first PUT wins). It returns once the object is
@@ -750,8 +766,20 @@ type putResult struct {
 //
 // If the action already exists, Put returns without reading body.
 func (c *Cache) Put(ctx context.Context, g Grant, actionID, outputID string, size int64, body io.Reader) error {
-	_, err := c.put(ctx, g, actionID, outputID, size, body)
+	_, err := c.put(ctx, g, actionID, outputID, size, body, new(putTiming))
 	return err
+}
+
+// putTiming is how long the phases of one put took. A phase that didn't
+// happen has a zero duration.
+type putTiming struct {
+	exists    time.Duration // DynamoDB check for an existing action
+	spoolWait time.Duration // waiting for buffer space for a blob
+	receive   time.Duration // reading the body (and hashing and compressing a blob)
+	blobCheck time.Duration // checking whether the blob is already stored
+	upload    time.Duration // uploading the blob
+	meta      time.Duration // writing the action item
+	blobBytes int64         // blob (lz4) bytes uploaded
 }
 
 // putStoreTimeout returns how long the blob upload and metadata write for a
@@ -764,7 +792,8 @@ func putStoreTimeout(n int64) time.Duration {
 // [Config.MaxObjectSize].
 var ErrTooLarge = errors.New("awscache: object too large")
 
-func (c *Cache) put(ctx context.Context, g Grant, actionID, outputID string, size int64, body io.Reader) (putResult, error) {
+// put is Put, also reporting what it did, and filling in tm.
+func (c *Cache) put(ctx context.Context, g Grant, actionID, outputID string, size int64, body io.Reader, tm *putTiming) (putResult, error) {
 	if !validHex(actionID) || !validHex(outputID) {
 		return putResult{}, ErrBadID
 	}
@@ -784,7 +813,10 @@ func (c *Cache) put(ctx context.Context, g Grant, actionID, outputID string, siz
 
 	// Most PUTs in CI are for actions some earlier job already stored, so
 	// check before doing any work.
-	if exists, err := c.meta.ActionExists(ctx, key); err != nil {
+	start := time.Now()
+	exists, err := c.meta.ActionExists(ctx, key)
+	tm.exists = time.Since(start)
+	if err != nil {
 		// Not fatal: the conditional write below still keeps the first.
 		c.logf("awscache: PUT %s: existence check: %v", key, err)
 	} else if exists {
@@ -802,7 +834,9 @@ func (c *Cache) put(ctx context.Context, g Grant, actionID, outputID string, siz
 
 	res := putResult{storage: "inline"}
 	if size <= c.cfg.InlineMax {
+		start := time.Now()
 		data, err := io.ReadAll(io.LimitReader(body, size+1))
+		tm.receive = time.Since(start)
 		if err != nil {
 			return putResult{}, fmt.Errorf("reading body: %w", err)
 		}
@@ -815,7 +849,7 @@ func (c *Cache) put(ctx context.Context, g Grant, actionID, outputID string, siz
 		}
 	} else {
 		res.storage = "s3"
-		if err := c.storeBlob(ctx, key, e, body); err != nil {
+		if err := c.storeBlob(ctx, key, e, body, tm); err != nil {
 			return putResult{}, err
 		}
 	}
@@ -824,7 +858,9 @@ func (c *Cache) put(ctx context.Context, g Grant, actionID, outputID string, siz
 	// client gives up waiting: it's still useful to the next client.
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), putStoreTimeout(size))
 	defer cancel()
+	start = time.Now()
 	created, err := c.meta.PutActionIfAbsent(ctx, key, e)
+	tm.meta = time.Since(start)
 	if err != nil {
 		return putResult{}, fmt.Errorf("storing metadata: %w", err)
 	}
@@ -837,11 +873,13 @@ func (c *Cache) put(ctx context.Context, g Grant, actionID, outputID string, siz
 }
 
 // storeBlob reads e.Size bytes from body into a spool, hashing and
-// lz4-compressing them on the way, then uploads the result to S3 under its
-// content address, unless it's already there. It fills in e's SHA256 and
-// StoredSize.
-func (c *Cache) storeBlob(ctx context.Context, key string, e *actionEntry, body io.Reader) error {
+// lz4-compressing them on the way, then uploads the result under its
+// content address, unless it's already
+// there. It fills in e's SHA256 and StoredSize, and tm's blob phases.
+func (c *Cache) storeBlob(ctx context.Context, key string, e *actionEntry, body io.Reader, tm *putTiming) error {
+	start := time.Now()
 	sp, err := c.newSpool(ctx, e.Size)
+	tm.spoolWait = time.Since(start)
 	if err != nil {
 		return err
 	}
@@ -852,15 +890,17 @@ func (c *Cache) storeBlob(ctx context.Context, key string, e *actionEntry, body 
 	if err := zw.Apply(lz4.SizeOption(uint64(e.Size))); err != nil {
 		return err
 	}
+	start = time.Now()
 	n, err := io.Copy(io.MultiWriter(zw, h), io.LimitReader(body, e.Size+1))
+	if err == nil && n == e.Size {
+		err = zw.Close()
+	}
+	tm.receive = time.Since(start)
 	if err != nil {
-		return fmt.Errorf("reading body: %w", err)
+		return fmt.Errorf("reading and compressing body: %w", err)
 	}
 	if n != e.Size {
 		return fmt.Errorf("body was %d bytes; want %d", n, e.Size)
-	}
-	if err := zw.Close(); err != nil {
-		return fmt.Errorf("compressing: %w", err)
 	}
 	e.SHA256 = hex.EncodeToString(h.Sum(nil))
 	e.StoredSize = sp.Size()
@@ -872,9 +912,9 @@ func (c *Cache) storeBlob(ctx context.Context, key string, e *actionEntry, body 
 		c.m.blobSkips.WithLabelValues("known").Inc()
 		return nil
 	}
-	// TODO(bradfitz): ask the optional NVMe cache pool before S3, which
-	// would usually know about recently written blobs.
+	start = time.Now()
 	exists, err := c.blobs.Exists(ctx, bk)
+	tm.blobCheck = time.Since(start)
 	if err != nil {
 		// Not fatal: an upload is still correct.
 		c.logf("awscache: PUT %s: checking for blob %s: %v", key, e.SHA256, err)
@@ -886,9 +926,13 @@ func (c *Cache) storeBlob(ctx context.Context, key string, e *actionEntry, body 
 		if err != nil {
 			return err
 		}
-		if err := c.blobs.Put(ctx, bk, r, e.StoredSize); err != nil {
+		start := time.Now()
+		err = c.blobs.Put(ctx, bk, r, e.StoredSize)
+		tm.upload = time.Since(start)
+		if err != nil {
 			return fmt.Errorf("uploading blob %s: %w", e.SHA256, err)
 		}
+		tm.blobBytes = e.StoredSize
 		c.m.blobUploads.Inc()
 		c.m.blobUploadBytes.Add(float64(e.StoredSize))
 	}

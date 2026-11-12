@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -41,7 +42,11 @@ func (c *Cache) NewHandler(grant func(*http.Request) Grant) *Handler {
 }
 
 // Stats are counters of a [Handler]'s requests. The fields and their JSON
-// names match gocached's session stats, served at /session/stats.
+// names match gocached's session stats, served at /session/stats, except for
+// GetTiers and PutTiers, which gocached doesn't have.
+//
+// The durations are sums over requests, which run concurrently, so they can
+// add up to more than the wall time.
 type Stats struct {
 	LastUsed       time.Time
 	Gets           int64
@@ -57,6 +62,45 @@ type Stats struct {
 	PutsBytes      int64
 	PutsInline     int64
 	PutsNanos      int64
+
+	// GetTiers breaks gets down by where they were served from: "inline"
+	// (from DynamoDB), "s3", "miss", or "error".
+	GetTiers map[string]GetTierStats `json:",omitempty"`
+
+	// PutTiers breaks puts down by where they stored the object: "inline",
+	// "s3", "dup" (already stored, so not stored again), or "error".
+	PutTiers map[string]PutTierStats `json:",omitempty"`
+}
+
+// GetTierStats are the counters of the gets served from one tier, with the
+// total time spent in each phase.
+type GetTierStats struct {
+	Gets  int64
+	Nanos int64 // whole gets
+
+	LookupNanos    int64 // DynamoDB action lookups
+	FirstByteNanos int64 // blob GETs, to their response headers
+	TransferNanos  int64 // sending response bodies, streaming blobs from S3
+
+	BlobBytes int64 // blob (lz4) bytes streamed from S3
+	SentBytes int64 // response body bytes written to the client
+}
+
+// PutTierStats are the counters of the puts that stored objects in one tier,
+// with the total time spent in each phase.
+type PutTierStats struct {
+	Puts  int64
+	Nanos int64 // whole puts
+
+	ExistsNanos    int64 // DynamoDB checks for an existing action
+	SpoolWaitNanos int64 // waiting for buffer space for blobs
+	ReceiveNanos   int64 // reading bodies (and hashing and compressing blobs)
+	BlobCheckNanos int64 // checking whether blobs are already stored
+	UploadNanos    int64 // uploading blobs
+	MetaNanos      int64 // writing action items
+
+	BlobUploads int64 // blobs uploaded, rather than found already stored
+	BlobBytes   int64 // blob (lz4) bytes uploaded
 }
 
 type stats struct {
@@ -74,6 +118,10 @@ type stats struct {
 	putsBytes      atomic.Int64
 	putsInline     atomic.Int64
 	putsNanos      atomic.Int64
+
+	tierMu   sync.Mutex
+	getTiers map[string]*GetTierStats // or nil
+	putTiers map[string]*PutTierStats // or nil
 }
 
 // Stats returns a snapshot of h's counters.
@@ -97,7 +145,108 @@ func (h *Handler) Stats() Stats {
 	if n := s.lastUsed.Load(); n != 0 {
 		st.LastUsed = time.Unix(0, n).UTC()
 	}
+	s.tierMu.Lock()
+	defer s.tierMu.Unlock()
+	if len(s.getTiers) > 0 {
+		st.GetTiers = map[string]GetTierStats{}
+		for tier, ts := range s.getTiers {
+			st.GetTiers[tier] = *ts
+		}
+	}
+	if len(s.putTiers) > 0 {
+		st.PutTiers = map[string]PutTierStats{}
+		for tier, ts := range s.putTiers {
+			st.PutTiers[tier] = *ts
+		}
+	}
 	return st
+}
+
+// recordGet records the timing of one get, which took d in all, in h's
+// stats and the cache's metrics. transfer is how long it took to send the
+// response body, sent bytes of it, which for a blob streamed blobBytes from
+// S3.
+func (h *Handler) recordGet(tier string, d time.Duration, tm *getTiming, transfer time.Duration, sent, blobBytes int64) {
+	m := h.c.m
+	phases := []struct {
+		name string
+		d    time.Duration
+		sum  func(*GetTierStats) *int64
+	}{
+		{"lookup", tm.lookup, func(ts *GetTierStats) *int64 { return &ts.LookupNanos }},
+		{"first_byte", tm.firstByte, func(ts *GetTierStats) *int64 { return &ts.FirstByteNanos }},
+		{"transfer", transfer, func(ts *GetTierStats) *int64 { return &ts.TransferNanos }},
+	}
+	if blobBytes > 0 {
+		m.blobBytes.WithLabelValues("get", tier).Add(float64(blobBytes))
+	}
+
+	s := &h.st
+	s.tierMu.Lock()
+	defer s.tierMu.Unlock()
+	if s.getTiers == nil {
+		s.getTiers = map[string]*GetTierStats{}
+	}
+	ts := s.getTiers[tier]
+	if ts == nil {
+		ts = new(GetTierStats)
+		s.getTiers[tier] = ts
+	}
+	ts.Gets++
+	ts.Nanos += d.Nanoseconds()
+	ts.BlobBytes += blobBytes
+	ts.SentBytes += sent
+	for _, p := range phases {
+		if p.d > 0 {
+			m.getPhase.WithLabelValues(tier, p.name).Observe(p.d.Seconds())
+			*p.sum(ts) += p.d.Nanoseconds()
+		}
+	}
+}
+
+// recordPut records the timing of one put, which took d in all, in h's
+// stats and the cache's metrics.
+func (h *Handler) recordPut(tier string, d time.Duration, tm *putTiming) {
+	m := h.c.m
+	phases := []struct {
+		name string
+		d    time.Duration
+		sum  func(*PutTierStats) *int64
+	}{
+		{"exists", tm.exists, func(ts *PutTierStats) *int64 { return &ts.ExistsNanos }},
+		{"spool_wait", tm.spoolWait, func(ts *PutTierStats) *int64 { return &ts.SpoolWaitNanos }},
+		{"receive", tm.receive, func(ts *PutTierStats) *int64 { return &ts.ReceiveNanos }},
+		{"blob_check", tm.blobCheck, func(ts *PutTierStats) *int64 { return &ts.BlobCheckNanos }},
+		{"upload", tm.upload, func(ts *PutTierStats) *int64 { return &ts.UploadNanos }},
+		{"meta", tm.meta, func(ts *PutTierStats) *int64 { return &ts.MetaNanos }},
+	}
+	if tm.blobBytes > 0 {
+		m.blobBytes.WithLabelValues("put", tier).Add(float64(tm.blobBytes))
+	}
+
+	s := &h.st
+	s.tierMu.Lock()
+	defer s.tierMu.Unlock()
+	if s.putTiers == nil {
+		s.putTiers = map[string]*PutTierStats{}
+	}
+	ts := s.putTiers[tier]
+	if ts == nil {
+		ts = new(PutTierStats)
+		s.putTiers[tier] = ts
+	}
+	ts.Puts++
+	ts.Nanos += d.Nanoseconds()
+	if tm.upload > 0 {
+		ts.BlobUploads++
+		ts.BlobBytes += tm.blobBytes
+	}
+	for _, p := range phases {
+		if p.d > 0 {
+			m.putPhase.WithLabelValues(tier, p.name).Observe(p.d.Seconds())
+			*p.sum(ts) += p.d.Nanoseconds()
+		}
+	}
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -132,7 +281,11 @@ func (h *Handler) serveGet(w http.ResponseWriter, r *http.Request) {
 	c.m.activeGets.Inc()
 	defer c.m.activeGets.Dec()
 	start := c.now()
+	wallStart := time.Now()
 	storage, typ := "none", "error"
+	var tm getTiming
+	var transfer time.Duration
+	var sent, blobBytes int64
 	defer func() {
 		d := c.now().Sub(start)
 		h.st.lastUsed.Store(c.now().UnixNano())
@@ -141,6 +294,11 @@ func (h *Handler) serveGet(w http.ResponseWriter, r *http.Request) {
 		if typ == "error" {
 			h.st.getErrs.Add(1)
 		}
+		tier := typ
+		if typ == "hit" {
+			tier = storage
+		}
+		h.recordGet(tier, time.Since(wallStart), &tm, transfer, sent, blobBytes)
 	}()
 	h.st.gets.Add(1)
 
@@ -156,7 +314,7 @@ func (h *Handler) serveGet(w http.ResponseWriter, r *http.Request) {
 	}
 
 	g := h.grant(r)
-	o, bumped, err := c.get(r.Context(), g, actionID)
+	o, bumped, err := c.get(r.Context(), g, actionID, &tm)
 	if err != nil {
 		if r.Context().Err() == nil {
 			c.logf("awscache: GET %s: %v", actionID, err)
@@ -195,7 +353,12 @@ func (h *Handler) serveGet(w http.ResponseWriter, r *http.Request) {
 	if r.Method == "HEAD" {
 		return
 	}
+	transferStart := time.Now()
 	n, err := body.WriteTo(w)
+	transfer, sent = time.Since(transferStart), n
+	if o.blob != nil {
+		blobBytes = o.blobSize
+	}
 	h.st.getBytes.Add(n)
 	if err != nil {
 		// The headers are already sent. Abort the response, so that the
@@ -237,7 +400,9 @@ func (h *Handler) servePut(w http.ResponseWriter, r *http.Request) {
 	c.m.activePuts.Inc()
 	defer c.m.activePuts.Dec()
 	start := c.now()
+	wallStart := time.Now()
 	storage, typ := "none", "error"
+	var tm putTiming
 	defer func() {
 		d := c.now().Sub(start)
 		h.st.lastUsed.Store(c.now().UnixNano())
@@ -246,6 +411,11 @@ func (h *Handler) servePut(w http.ResponseWriter, r *http.Request) {
 		if typ == "error" {
 			h.st.putErrs.Add(1)
 		}
+		tier := storage
+		if typ == "error" {
+			tier = "error"
+		}
+		h.recordPut(tier, time.Since(wallStart), &tm)
 	}()
 
 	actionID, outputID, ok := strings.Cut(strings.TrimPrefix(r.URL.Path, "/"), "/")
@@ -265,7 +435,7 @@ func (h *Handler) servePut(w http.ResponseWriter, r *http.Request) {
 	defer rc.SetReadDeadline(time.Time{})
 
 	g := h.grant(r)
-	res, err := c.put(r.Context(), g, actionID, outputID, size, r.Body)
+	res, err := c.put(r.Context(), g, actionID, outputID, size, r.Body, &tm)
 	switch {
 	case errors.Is(err, ErrReadOnly):
 		http.Error(w, "forbidden: read-only", http.StatusForbidden)

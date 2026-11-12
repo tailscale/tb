@@ -324,6 +324,52 @@ func TestRoundTrip(t *testing.T) {
 	}
 }
 
+func TestTierStats(t *testing.T) {
+	env := newTestEnv(t)
+	writer := env.newClient(env.newCache(nil), writeGlobal)
+	c := env.newCache(nil)
+	reader := env.newClient(c, Grant{})
+
+	writer.put("aaaa01", "0b01", randBytes(50))   // inline
+	writer.put("aaaa02", "0b02", randBytes(1000)) // s3
+	writer.put("aaaa02", "0b02", randBytes(1000)) // dup
+	for _, id := range []string{"aaaa01", "aaaa02", "bbbb01"} {
+		reader.get(id)
+	}
+
+	puts := writer.h.Stats().PutTiers
+	for tier, want := range map[string]int64{"inline": 1, "s3": 1, "dup": 1} {
+		if puts[tier].Puts != want {
+			t.Errorf("PutTiers[%q].Puts = %d; want %d", tier, puts[tier].Puts, want)
+		}
+	}
+	if ts := puts["s3"]; ts.BlobUploads != 1 || ts.BlobBytes == 0 || ts.UploadNanos == 0 || ts.BlobCheckNanos == 0 || ts.ReceiveNanos == 0 || ts.MetaNanos == 0 {
+		t.Errorf("PutTiers[s3] = %+v; want an upload and its phases", ts)
+	}
+	if ts := puts["dup"]; ts.ExistsNanos == 0 || ts.ReceiveNanos != 0 {
+		t.Errorf("PutTiers[dup] = %+v; want only the existence check", ts)
+	}
+
+	gets := reader.h.Stats().GetTiers
+	for tier, want := range map[string]int64{"inline": 1, "s3": 1, "miss": 1} {
+		if ts := gets[tier]; ts.Gets != want || ts.LookupNanos == 0 {
+			t.Errorf("GetTiers[%q] = %+v; want %d gets with lookups", tier, ts, want)
+		}
+	}
+	if ts := gets["inline"]; ts.FirstByteNanos != 0 || ts.TransferNanos == 0 || ts.SentBytes != 50 {
+		t.Errorf("GetTiers[inline] = %+v; want no blob phases, and 50 bytes sent", ts)
+	}
+	if ts := gets["s3"]; ts.FirstByteNanos == 0 || ts.TransferNanos == 0 || ts.BlobBytes == 0 || ts.SentBytes == 0 {
+		t.Errorf("GetTiers[s3] = %+v; want every blob phase", ts)
+	}
+	if got := testutil.ToFloat64(c.m.blobBytes.WithLabelValues("get", "s3")); got != float64(gets["s3"].BlobBytes) {
+		t.Errorf("s3 blob bytes metric = %v; want %d", got, gets["s3"].BlobBytes)
+	}
+	// inline: lookup, transfer; s3: all three phases; miss: lookup.
+	if got := testutil.CollectAndCount(c.m.getPhase); got != 2+3+1 {
+		t.Errorf("get phase series = %d; want %d", got, 2+3+1)
+	}
+}
 func TestNamespaces(t *testing.T) {
 	env := newTestEnv(t)
 	c := env.newCache(nil)
@@ -620,6 +666,9 @@ func TestSessionStats(t *testing.T) {
 	}
 	if got["Gets"] != 1.0 || got["GetHits"] != 1.0 || got["Puts"] != 1.0 {
 		t.Errorf("stats = %v", got)
+	}
+	if tiers, _ := got["GetTiers"].(map[string]any); tiers["inline"] == nil {
+		t.Errorf("stats GetTiers = %v; want an inline tier", got["GetTiers"])
 	}
 }
 
