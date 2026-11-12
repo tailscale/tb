@@ -1,0 +1,26 @@
+#!/bin/bash
+# Sets up the lab VM: Go, a C compiler for cgo, checkouts of this repo and
+# tailscale/tailscale in ec2-user's home, and the environment for the tests
+# in /etc/profile.d.
+set -euxo pipefail
+
+dnf install -y git gcc tar tmux
+
+curl -fsSL "https://go.dev/dl/go${go_version}.linux-amd64.tar.gz" | tar -C /usr/local -xz
+
+cat >/etc/profile.d/awscache-lab.sh <<'EOF'
+export PATH=/usr/local/go/bin:$HOME/go/bin:$PATH
+# /tmp is a tmpfs; keep build caches on disk, as on CI runners.
+export TMPDIR=$HOME/tmp
+mkdir -p "$TMPDIR"
+%{ for k, v in test_env ~}
+export ${k}=${v}
+%{ endfor ~}
+export AWSCACHE_BENCH_TAILSCALE_DIR=$HOME/tailscale
+EOF
+
+sudo -iu ec2-user git clone --branch "${repo_branch}" "${repo_url}" tb ||
+  sudo -iu ec2-user git clone "${repo_url}" tb
+
+sudo -iu ec2-user git clone --filter=blob:none https://github.com/tailscale/tailscale.git tailscale
+sudo -iu ec2-user git -C tailscale checkout "${tailscale_ref}"
