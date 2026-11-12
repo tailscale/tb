@@ -67,3 +67,21 @@ variable "blob_expiry_days" {
   type        = number
   default     = 7
 }
+
+variable "enable_gocached" {
+  description = "Whether to create a gocached VM with instance-store NVMe, for the benchmark's gocached and ddbgocached configs."
+  type        = bool
+  default     = true
+}
+
+variable "gocached_instance_type" {
+  description = "EC2 instance type of the gocached VM. It must have instance-store NVMe. The default is the type of today's ci-gocached-aws-1; if it's not available in the region, try i4i.xlarge."
+  type        = string
+  default     = "i7i.xlarge"
+}
+
+variable "gocached_max_size_gb" {
+  description = "gocached's --max-size-gb. It must fit on the gocached VM's instance-store NVMe."
+  type        = number
+  default     = 700
+}

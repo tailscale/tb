@@ -32,3 +32,18 @@ output "region" {
   description = "The lab's region, for AWS CLI commands."
   value       = var.region
 }
+
+output "gocached_url" {
+  description = "gocached's URL, for the benchmark's -buildbench.gocached (or $AWSCACHE_BENCH_GOCACHED_URL on the benchmark VM)."
+  value       = var.enable_gocached ? local.gocached_url : null
+}
+
+output "gocached_instance_id" {
+  description = "The gocached VM."
+  value       = var.enable_gocached ? aws_instance.gocached[0].id : null
+}
+
+output "gocached_ssh_command" {
+  description = "Opens a shell on the gocached VM as ec2-user, with EC2 Instance Connect, from var.my_ip."
+  value       = var.enable_gocached ? "aws ec2-instance-connect ssh --region ${var.region} --instance-id ${aws_instance.gocached[0].id} --os-user ec2-user --connection-type direct" : null
+}

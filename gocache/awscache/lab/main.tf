@@ -292,3 +292,83 @@ locals {
     AWSCACHE_TEST_EXPRESS_BUCKET = aws_s3_directory_bucket.express.bucket
   }
 }
+
+# A gocached server with its cache on instance-store NVMe, like today's
+# ci-gocached-aws-1 (without S3 Files behind it), for the benchmark's
+# gocached config, and in the role of an NVMe cache pod for its ddbgocached
+# config. It has a fixed address, so that its URL doesn't change if it's
+# replaced.
+
+locals {
+  gocached_ip  = cidrhost(aws_subnet.lab.cidr_block, 250)
+  gocached_url = "http://${local.gocached_ip}:31364"
+}
+
+resource "aws_security_group" "gocached" {
+  count = var.enable_gocached ? 1 : 0
+
+  name        = "${var.name}-gocached"
+  description = "${var.name} gocached VM: gocached from the benchmark VM, SSH from var.my_ip, all outbound"
+  vpc_id      = aws_vpc.lab.id
+
+  ingress {
+    description     = "gocached (31364) and its debug server (31365) from the benchmark VM"
+    from_port       = 31364
+    to_port         = 31365
+    protocol        = "tcp"
+    security_groups = [aws_security_group.vm.id]
+  }
+
+  ingress {
+    description = "SSH from var.my_ip"
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = ["${var.my_ip}/32"]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
+resource "aws_instance" "gocached" {
+  count = var.enable_gocached ? 1 : 0
+
+  ami                    = data.aws_ssm_parameter.al2023.value
+  instance_type          = var.gocached_instance_type
+  subnet_id              = aws_subnet.lab.id
+  private_ip             = local.gocached_ip
+  vpc_security_group_ids = [aws_security_group.gocached[0].id]
+  # For SSM Session Manager; gocached itself needs no AWS access.
+  iam_instance_profile = aws_iam_instance_profile.vm.name
+
+  metadata_options {
+    http_tokens                 = "required"
+    http_put_response_hop_limit = 1
+  }
+
+  root_block_device {
+    volume_type = "gp3"
+    volume_size = 30
+  }
+
+  user_data = templatefile("${path.module}/gocached-user-data.sh.tftpl", {
+    go_version  = var.go_version
+    repo_url    = var.repo_url
+    repo_branch = var.repo_branch
+    max_size_gb = var.gocached_max_size_gb
+  })
+  user_data_replace_on_change = true
+
+  lifecycle {
+    ignore_changes = [ami]
+  }
+
+  tags = {
+    Name = "${var.name}-gocached"
+  }
+}
