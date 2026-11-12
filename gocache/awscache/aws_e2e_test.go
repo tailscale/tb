@@ -18,6 +18,8 @@ import (
 // region from the environment as usual. It's skipped without them. If
 // $AWSCACHE_TEST_EXPRESS_BUCKET is also set, it runs again with that S3
 // Express One Zone directory bucket as the bucket.
+//
+// The lab environment in lab/ provides all of these.
 func TestRealAWS(t *testing.T) {
 	table, bucket := os.Getenv("AWSCACHE_TEST_TABLE"), os.Getenv("AWSCACHE_TEST_BUCKET")
 	if table == "" || bucket == "" {
