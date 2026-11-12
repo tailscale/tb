@@ -17,8 +17,9 @@
 // keyed "a#<namespace>#<actionID>", holding the output ID, size, create and
 // access times, its TTL, and either the object's bytes inline (objects up to
 // [Config.InlineMax]) or the SHA-256 and stored size of the object's blob in
-// S3. The global namespace is stored as "!global:<generation>", so bumping
-// [Config.GlobalGeneration] starts it afresh while the old items expire.
+// S3, and which bucket holds the blob. The global namespace is stored as
+// "!global:<generation>", so bumping [Config.GlobalGeneration] starts it
+// afresh while the old items expire.
 //
 // S3 holds lz4-compressed blobs at "<prefix><sha[:2]>/<sha>.lz4", content
 // addressed by the SHA-256 of the uncompressed bytes, computed by the
@@ -32,8 +33,13 @@
 // content (damaged, or overwritten) makes the response fail before its end,
 // so the client discards it.
 //
-// The bucket may be an S3 Express One Zone directory bucket (a name ending
-// in "--x-s3"), whose time to first byte is much lower than S3 Standard's.
+// Optionally, mid-size blobs (objects up to [Config.MidMax]) go to a second
+// bucket, [Config.MidBucket], instead of [Config.Bucket]. It's meant to be
+// an S3 Express One Zone directory bucket in the clients' AZ, which has a
+// much lower time to first byte than S3 Standard. Writers choose the bucket
+// by the object's uncompressed size, so the same content always goes to the
+// same bucket.
+//
 // A directory bucket can't require If-None-Match: * on PUTs, so anything
 // with write access to it can overwrite a blob. The hash check on GET makes
 // an overwritten blob fail rather than serve other content.
@@ -151,10 +157,22 @@ type Config struct {
 	// that, EC2 instance metadata.
 	Region string
 
-	// Bucket is the S3 bucket holding blobs. Required. It may be an S3
-	// Express One Zone directory bucket (a name ending in "--x-s3"), which
-	// should be in the same AZ as the clients.
+	// Bucket is the S3 bucket holding blobs. Required.
 	Bucket string
+
+	// MidBucket, if non-empty, is the S3 bucket holding mid-size blobs:
+	// those of objects larger than InlineMax and at most MidMax bytes,
+	// uncompressed. It's meant to be an S3 Express One Zone directory
+	// bucket (a name ending in "--x-s3") in the same AZ as the clients.
+	// Larger blobs go to Bucket.
+	//
+	// Every Cache that reads entries written with a MidBucket must also
+	// have it; a Cache without one treats such entries as misses.
+	MidBucket string
+
+	// MidMax is the largest object (uncompressed) whose blob goes to
+	// MidBucket. It's only used with a MidBucket. Default 4MiB.
+	MidMax int64
 
 	// BlobPrefix is prepended to every S3 key, e.g. "v1/".
 	BlobPrefix string
@@ -228,10 +246,17 @@ type Config struct {
 	// loading the default one.
 	AWSConfig *aws.Config
 
-	// Test hooks, replacing the AWS clients and clock.
-	meta  metaStore
-	blobs blobStore
-	now   func() time.Time
+	// Test hooks, replacing the AWS clients and clock. A non-nil midBlobs
+	// enables the mid-size bucket, as MidBucket does.
+	meta     metaStore
+	blobs    blobStore
+	midBlobs blobStore
+	now      func() time.Time
+}
+
+// midEnabled reports whether mid-size blobs go to their own bucket.
+func (cfg *Config) midEnabled() bool {
+	return cfg.MidBucket != "" || cfg.midBlobs != nil
 }
 
 // Cache is a Go build cache stored in DynamoDB and S3. It's safe for
@@ -243,6 +268,7 @@ type Cache struct {
 	m        *metrics
 	meta     metaStore
 	blobs    blobStore
+	mid      blobStore // or nil, if mid-size blobs go to blobs
 	checks   []func(context.Context) error
 	globalNS storageNS
 	bumper   *atimeBumper
@@ -284,10 +310,17 @@ func New(ctx context.Context, cfg Config) (*Cache, error) {
 		}
 		ddb := &dynamoStore{c: dynamodb.NewFromConfig(awsCfg), table: cfg.Table, consistentReads: cfg.ConsistentReads, m: m}
 		// The S3 client finds directory buckets by their "--x-s3" suffix
-		// and handles their session authentication itself.
-		bs := &s3Store{c: s3.NewFromConfig(awsCfg), bucket: cfg.Bucket, service: s3Service(cfg.Bucket), m: m}
+		// and handles their session authentication itself, so one client
+		// serves both buckets.
+		s3c := s3.NewFromConfig(awsCfg)
+		bs := &s3Store{c: s3c, bucket: cfg.Bucket, service: "s3", m: m}
 		cfg.meta, cfg.blobs = ddb, bs
 		checks = append(checks, ddb.checkTable, bs.checkBucket)
+		if cfg.MidBucket != "" && cfg.midBlobs == nil {
+			mid := &s3Store{c: s3c, bucket: cfg.MidBucket, service: midService(cfg.MidBucket), m: m}
+			cfg.midBlobs = mid
+			checks = append(checks, mid.checkBucket)
+		}
 	}
 
 	c := &Cache{
@@ -297,6 +330,7 @@ func New(ctx context.Context, cfg Config) (*Cache, error) {
 		m:          m,
 		meta:       cfg.meta,
 		blobs:      cfg.blobs,
+		mid:        cfg.midBlobs,
 		checks:     checks,
 		globalNS:   globalStorageNS(cfg.GlobalGeneration),
 		memSem:     semaphore.NewWeighted(cfg.MemBudget),
@@ -350,6 +384,9 @@ func (cfg *Config) fillDefaults() error {
 	if cfg.ATimeWorkers == 0 {
 		cfg.ATimeWorkers = 4
 	}
+	if cfg.MidMax == 0 && cfg.midEnabled() {
+		cfg.MidMax = 4 << 20
+	}
 	if cfg.Logf == nil {
 		cfg.Logf = logPrintf
 	}
@@ -367,6 +404,10 @@ func (cfg *Config) fillDefaults() error {
 		return errors.New("awscache: MemBudget, SpoolCap, Retention, Relatime, and GlobalGeneration must not be negative")
 	case cfg.Relatime >= cfg.Retention:
 		return fmt.Errorf("awscache: Relatime %v must be less than Retention %v", cfg.Relatime, cfg.Retention)
+	case cfg.MidMax != 0 && !cfg.midEnabled():
+		return errors.New("awscache: MidMax requires MidBucket")
+	case cfg.midEnabled() && cfg.MidMax <= cfg.InlineMax:
+		return fmt.Errorf("awscache: MidMax %d must exceed InlineMax %d", cfg.MidMax, cfg.InlineMax)
 	}
 	return nil
 }
@@ -461,7 +502,8 @@ type Object struct {
 	blobSize int64         // size of blob
 	sha256   string        // hex SHA-256 of the blob's uncompressed content
 
-	// storage is where the object came from: "inline" or "s3".
+	// storage is where the object came from: "inline", "s3", or "mid"
+	// (the mid-size bucket).
 	storage string
 }
 
@@ -675,7 +717,7 @@ func (c *Cache) get(ctx context.Context, g Grant, actionID string, tm *getTiming
 		blob:     blob,
 		blobSize: e.StoredSize,
 		sha256:   e.SHA256,
-		storage:  "s3",
+		storage:  blobStorage(e.Mid),
 	}, bumped, nil
 }
 
@@ -716,8 +758,17 @@ func (c *Cache) lookupAction(ctx context.Context, g Grant, actionID string) (key
 // (nil, nil) if the blob is missing or isn't the size e says. It fills in
 // tm's first byte time.
 func (c *Cache) openBlob(ctx context.Context, key string, e *actionEntry, tm *getTiming) (io.ReadCloser, error) {
+	store := c.blobs
+	if e.Mid {
+		if c.mid == nil {
+			// Written by a Cache with a MidBucket. We can't read it.
+			c.m.midUnavailable.Inc()
+			return nil, nil
+		}
+		store = c.mid
+	}
 	start := time.Now()
-	rc, size, err := c.blobs.Get(ctx, blobKey(c.cfg.BlobPrefix, e.SHA256))
+	rc, size, err := store.Get(ctx, blobKey(c.cfg.BlobPrefix, e.SHA256))
 	tm.firstByte = time.Since(start)
 	if errors.Is(err, errBlobNotFound) {
 		// PUT writes the blob before the action, so this means the
@@ -745,17 +796,25 @@ func (c *Cache) openBlob(ctx context.Context, key string, e *actionEntry, tm *ge
 
 // putResult is the outcome of a put: whether and where it stored the object.
 type putResult struct {
-	storage string // "inline", "s3", or "dup" (already stored)
+	storage string // "inline", "s3", "mid", or "dup" (already stored)
 	created bool   // false if the action already existed
 }
 
-// s3Service returns the metrics service name of bucket: "s3express" for a
-// directory bucket, else "s3".
-func s3Service(bucket string) string {
+// blobStorage returns the storage name of a blob in the mid-size bucket (if
+// mid) or the main bucket, as used in metrics and [Object].
+func blobStorage(mid bool) string {
+	if mid {
+		return "mid"
+	}
+	return "s3"
+}
+
+// midService returns the metrics service name of the mid-size bucket.
+func midService(bucket string) string {
 	if strings.HasSuffix(bucket, "--x-s3") {
 		return "s3express"
 	}
-	return "s3"
+	return "s3mid"
 }
 
 // Put stores the size-byte object read from body as the output outputID of
@@ -848,7 +907,8 @@ func (c *Cache) put(ctx context.Context, g Grant, actionID, outputID string, siz
 			e.Data = data
 		}
 	} else {
-		res.storage = "s3"
+		e.Mid = c.mid != nil && size <= c.cfg.MidMax
+		res.storage = blobStorage(e.Mid)
 		if err := c.storeBlob(ctx, key, e, body, tm); err != nil {
 			return putResult{}, err
 		}
@@ -874,7 +934,7 @@ func (c *Cache) put(ctx context.Context, g Grant, actionID, outputID string, siz
 
 // storeBlob reads e.Size bytes from body into a spool, hashing and
 // lz4-compressing them on the way, then uploads the result under its
-// content address, unless it's already
+// content address to the bucket that e.Mid selects, unless it's already
 // there. It fills in e's SHA256 and StoredSize, and tm's blob phases.
 func (c *Cache) storeBlob(ctx context.Context, key string, e *actionEntry, body io.Reader, tm *putTiming) error {
 	start := time.Now()
@@ -907,13 +967,18 @@ func (c *Cache) storeBlob(ctx context.Context, key string, e *actionEntry, body 
 
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), putStoreTimeout(e.Size))
 	defer cancel()
+	store := c.blobs
+	if e.Mid {
+		store = c.mid
+	}
 	bk := blobKey(c.cfg.BlobPrefix, e.SHA256)
-	if c.blobKnown(bk) {
+	knownKey := blobStorage(e.Mid) + ":" + bk
+	if c.blobKnown(knownKey) {
 		c.m.blobSkips.WithLabelValues("known").Inc()
 		return nil
 	}
 	start = time.Now()
-	exists, err := c.blobs.Exists(ctx, bk)
+	exists, err := store.Exists(ctx, bk)
 	tm.blobCheck = time.Since(start)
 	if err != nil {
 		// Not fatal: an upload is still correct.
@@ -927,7 +992,7 @@ func (c *Cache) storeBlob(ctx context.Context, key string, e *actionEntry, body 
 			return err
 		}
 		start := time.Now()
-		err = c.blobs.Put(ctx, bk, r, e.StoredSize)
+		err = store.Put(ctx, bk, r, e.StoredSize)
 		tm.upload = time.Since(start)
 		if err != nil {
 			return fmt.Errorf("uploading blob %s: %w", e.SHA256, err)
@@ -936,11 +1001,12 @@ func (c *Cache) storeBlob(ctx context.Context, key string, e *actionEntry, body 
 		c.m.blobUploads.Inc()
 		c.m.blobUploadBytes.Add(float64(e.StoredSize))
 	}
-	c.noteBlobKnown(bk)
+	c.noteBlobKnown(knownKey)
 	return nil
 }
 
-// blobKnown reports whether this process recently saw blob key bk exist.
+// blobKnown reports whether this process recently saw the blob exist. bk
+// is its blob key, prefixed by its bucket's storage name.
 //
 // This relies on the scrubber only deleting blobs that no action has
 // referenced for far longer than a Cache lives.

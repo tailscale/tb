@@ -44,6 +44,10 @@ type actionEntry struct {
 	// client), and StoredSize is the size of the lz4-compressed blob.
 	SHA256     string
 	StoredSize int64
+
+	// Mid is whether the blob is in the mid-size bucket rather than the
+	// main one.
+	Mid bool
 }
 
 // metaStore is the durable metadata store shared by every client. In
@@ -130,6 +134,7 @@ const (
 	attrData       = "d"   // inline object bytes (B); absent if empty
 	attrSHA256     = "h"   // blob SHA-256 hex (S)
 	attrStored     = "z"   // blob stored (lz4) size (N)
+	attrMid        = "m"   // whether the blob is in the mid-size bucket (BOOL); absent if not
 )
 
 // dynamoStore is a [metaStore] backed by a single DynamoDB table whose
@@ -249,6 +254,7 @@ func (d *dynamoStore) GetAction(ctx context.Context, key string) (_ *actionEntry
 		Data:       it.b(attrData),
 		SHA256:     it.s(attrSHA256),
 		StoredSize: it.n(attrStored),
+		Mid:        it.bool(attrMid),
 	}, nil
 }
 
@@ -292,6 +298,9 @@ func (d *dynamoStore) PutActionIfAbsent(ctx context.Context, key string, e *acti
 	} else {
 		it[attrSHA256] = avS(e.SHA256)
 		it[attrStored] = avN(e.StoredSize)
+		if e.Mid {
+			it[attrMid] = avBool(true)
+		}
 	}
 	_, err := d.c.PutItem(ctx, &dynamodb.PutItemInput{
 		TableName:                &d.table,
@@ -341,7 +350,8 @@ type s3Store struct {
 	bucket string
 	m      *metrics
 
-	// service is the service name in metrics, from [s3Service].
+	// service is the service name in metrics: "s3" for the main bucket,
+	// or the mid-size bucket's name from [midService].
 	service string
 }
 

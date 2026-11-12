@@ -170,6 +170,7 @@ type testEnv struct {
 	t     *testing.T
 	meta  *fakeMeta
 	blobs *fakeBlobs
+	mid   *fakeBlobs // only used by caches that set Config.midBlobs
 	clock *testClock
 }
 
@@ -178,6 +179,7 @@ func newTestEnv(t *testing.T) *testEnv {
 		t:     t,
 		meta:  newFakeMeta(),
 		blobs: newFakeBlobs(),
+		mid:   newFakeBlobs(),
 		clock: &testClock{t: time.Unix(1_800_000_000, 0)},
 	}
 }
@@ -324,34 +326,93 @@ func TestRoundTrip(t *testing.T) {
 	}
 }
 
+func TestMidBucket(t *testing.T) {
+	env := newTestEnv(t)
+	withMid := func(cfg *Config) {
+		cfg.midBlobs = env.mid
+		cfg.MidMax = 1000
+	}
+	writer := env.newClient(env.newCache(withMid), writeGlobal)
+	reader := env.newClient(env.newCache(withMid), Grant{}) // another host
+
+	objs := map[string][]byte{
+		"abcd01": randBytes(50),   // inline
+		"abcd02": randBytes(1000), // mid-size, at the limit
+		"abcd03": randBytes(1001), // main bucket
+	}
+	for id, data := range objs {
+		writer.put(id, "0b"+id, data)
+	}
+	for id, data := range objs {
+		reader.wantHit(id, "0b"+id, data)
+	}
+	for id, wantMid := range map[string]bool{"abcd02": true, "abcd03": false} {
+		if e, _ := env.meta.get(actionKey(globalStorageNS(0), id)); e.Inline || e.Mid != wantMid {
+			t.Errorf("%s entry = %+v; want Mid %v", id, e, wantMid)
+		}
+	}
+	if puts, _, _ := env.mid.counts(); puts != 1 {
+		t.Errorf("mid bucket puts = %d; want 1", puts)
+	}
+	if puts, _, _ := env.blobs.counts(); puts != 1 {
+		t.Errorf("main bucket puts = %d; want 1", puts)
+	}
+
+	// Another host stores the same mid-size content under another action:
+	// one HEAD of the mid bucket, no upload.
+	puts0, heads0, _ := env.mid.counts()
+	env.newClient(env.newCache(withMid), writeGlobal).put("abcd04", "0b04", objs["abcd02"])
+	if puts1, heads1, _ := env.mid.counts(); puts1 != puts0 || heads1 != heads0+1 {
+		t.Errorf("other host: mid puts %d->%d, heads %d->%d; want one HEAD, no PUT", puts0, puts1, heads0, heads1)
+	}
+
+	// A cache without the mid bucket misses on entries in it.
+	c := env.newCache(nil)
+	plain := env.newClient(c, Grant{})
+	plain.wantHit("abcd01", "0babcd01", objs["abcd01"])
+	plain.wantHit("abcd03", "0babcd03", objs["abcd03"])
+	plain.wantMiss("abcd02")
+	if got := testutil.ToFloat64(c.m.midUnavailable); got != 1 {
+		t.Errorf("mid unavailable = %v; want 1", got)
+	}
+}
+
 func TestTierStats(t *testing.T) {
 	env := newTestEnv(t)
-	writer := env.newClient(env.newCache(nil), writeGlobal)
-	c := env.newCache(nil)
+	withMid := func(cfg *Config) {
+		cfg.midBlobs = env.mid
+		cfg.MidMax = 1000
+	}
+	writer := env.newClient(env.newCache(withMid), writeGlobal)
+	c := env.newCache(withMid)
 	reader := env.newClient(c, Grant{})
 
 	writer.put("aaaa01", "0b01", randBytes(50))   // inline
-	writer.put("aaaa02", "0b02", randBytes(1000)) // s3
-	writer.put("aaaa02", "0b02", randBytes(1000)) // dup
-	for _, id := range []string{"aaaa01", "aaaa02", "bbbb01"} {
+	writer.put("aaaa02", "0b02", randBytes(1000)) // mid
+	writer.put("aaaa03", "0b03", randBytes(1001)) // s3
+	writer.put("aaaa03", "0b03", randBytes(1001)) // dup
+	for _, id := range []string{"aaaa01", "aaaa02", "aaaa03", "bbbb01"} {
 		reader.get(id)
 	}
 
 	puts := writer.h.Stats().PutTiers
-	for tier, want := range map[string]int64{"inline": 1, "s3": 1, "dup": 1} {
+	for tier, want := range map[string]int64{"inline": 1, "mid": 1, "s3": 1, "dup": 1} {
 		if puts[tier].Puts != want {
 			t.Errorf("PutTiers[%q].Puts = %d; want %d", tier, puts[tier].Puts, want)
 		}
 	}
-	if ts := puts["s3"]; ts.BlobUploads != 1 || ts.BlobBytes == 0 || ts.UploadNanos == 0 || ts.BlobCheckNanos == 0 || ts.ReceiveNanos == 0 || ts.MetaNanos == 0 {
-		t.Errorf("PutTiers[s3] = %+v; want an upload and its phases", ts)
+	for _, tier := range []string{"mid", "s3"} {
+		ts := puts[tier]
+		if ts.BlobUploads != 1 || ts.BlobBytes == 0 || ts.UploadNanos == 0 || ts.BlobCheckNanos == 0 || ts.ReceiveNanos == 0 || ts.MetaNanos == 0 {
+			t.Errorf("PutTiers[%q] = %+v; want an upload and its phases", tier, ts)
+		}
 	}
 	if ts := puts["dup"]; ts.ExistsNanos == 0 || ts.ReceiveNanos != 0 {
 		t.Errorf("PutTiers[dup] = %+v; want only the existence check", ts)
 	}
 
 	gets := reader.h.Stats().GetTiers
-	for tier, want := range map[string]int64{"inline": 1, "s3": 1, "miss": 1} {
+	for tier, want := range map[string]int64{"inline": 1, "mid": 1, "s3": 1, "miss": 1} {
 		if ts := gets[tier]; ts.Gets != want || ts.LookupNanos == 0 {
 			t.Errorf("GetTiers[%q] = %+v; want %d gets with lookups", tier, ts, want)
 		}
@@ -359,17 +420,33 @@ func TestTierStats(t *testing.T) {
 	if ts := gets["inline"]; ts.FirstByteNanos != 0 || ts.TransferNanos == 0 || ts.SentBytes != 50 {
 		t.Errorf("GetTiers[inline] = %+v; want no blob phases, and 50 bytes sent", ts)
 	}
-	if ts := gets["s3"]; ts.FirstByteNanos == 0 || ts.TransferNanos == 0 || ts.BlobBytes == 0 || ts.SentBytes == 0 {
-		t.Errorf("GetTiers[s3] = %+v; want every blob phase", ts)
+	for _, tier := range []string{"mid", "s3"} {
+		ts := gets[tier]
+		if ts.FirstByteNanos == 0 || ts.TransferNanos == 0 || ts.BlobBytes == 0 || ts.SentBytes == 0 {
+			t.Errorf("GetTiers[%q] = %+v; want every blob phase", tier, ts)
+		}
 	}
-	if got := testutil.ToFloat64(c.m.blobBytes.WithLabelValues("get", "s3")); got != float64(gets["s3"].BlobBytes) {
-		t.Errorf("s3 blob bytes metric = %v; want %d", got, gets["s3"].BlobBytes)
+	if got := testutil.ToFloat64(c.m.blobBytes.WithLabelValues("get", "mid")); got != float64(gets["mid"].BlobBytes) {
+		t.Errorf("mid blob bytes metric = %v; want %d", got, gets["mid"].BlobBytes)
 	}
-	// inline: lookup, transfer; s3: all three phases; miss: lookup.
-	if got := testutil.CollectAndCount(c.m.getPhase); got != 2+3+1 {
-		t.Errorf("get phase series = %d; want %d", got, 2+3+1)
+	// inline: lookup, transfer; mid and s3: all three phases; miss: lookup.
+	if got := testutil.CollectAndCount(c.m.getPhase); got != 2+3+3+1 {
+		t.Errorf("get phase series = %d; want %d", got, 2+3+3+1)
 	}
 }
+
+func TestMidConfig(t *testing.T) {
+	for _, cfg := range []Config{
+		{Bucket: "b", Table: "t", MidMax: 1 << 20},                   // no MidBucket
+		{Bucket: "b", Table: "t", MidBucket: "m--x-s3", MidMax: 500}, // not above InlineMax
+	} {
+		if c, err := New(context.Background(), cfg); err == nil {
+			c.Close(context.Background())
+			t.Errorf("New(%+v) succeeded; want error", cfg)
+		}
+	}
+}
+
 func TestNamespaces(t *testing.T) {
 	env := newTestEnv(t)
 	c := env.newCache(nil)

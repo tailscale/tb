@@ -105,6 +105,9 @@ func TestBuildBench(t *testing.T) {
 			Retention:        2 * 24 * time.Hour, // let bench items expire soon
 			Logf:             t.Logf,
 		}
+		if cfg.midMax != 0 {
+			ccfg.MidBucket, ccfg.MidMax = expressBucket, cfg.midMax
+		}
 		if cfg.pod {
 			// The stores Config would make, but with blobs in gocached.
 			awsCfg, err := loadAWSConfig(ctx, region)
@@ -173,7 +176,7 @@ func TestBuildBench(t *testing.T) {
 	b.gocachedURL = *buildBenchGocached
 	configs = slices.DeleteFunc(configs, func(cfg benchConfig) bool {
 		switch {
-		case cfg.express && expressBucket == "":
+		case (cfg.express || cfg.midMax != 0) && expressBucket == "":
 			t.Logf("skipping config %s: AWSCACHE_TEST_EXPRESS_BUCKET not set", cfg.name)
 			return true
 		case (cfg.gocached || cfg.pod) && b.gocachedURL == "":
@@ -286,6 +289,11 @@ type benchConfig struct {
 	// metadata in DynamoDB as usual: a simulation of the NVMe cache pod
 	// design, with one pod. See [podBlobStore].
 	pod bool
+
+	// midMax, if non-zero, is the Cache's MidMax: blobs of objects up to
+	// midMax bytes go to $AWSCACHE_TEST_EXPRESS_BUCKET as the mid-size
+	// bucket, and larger ones to $AWSCACHE_TEST_BUCKET.
+	midMax int64
 }
 
 func (c benchConfig) itemName() string { return c.name }
@@ -295,6 +303,9 @@ var benchConfigs = []benchConfig{
 	{name: "express", index: 1, express: true}, // S3 Express One Zone
 	{name: "gocached", index: 2, gocached: true},
 	{name: "ddbgocached", index: 3, pod: true},
+	{name: "mid512k", index: 4, midMax: 512 << 10},
+	{name: "mid4m", index: 5, midMax: 4 << 20},
+	{name: "midall", index: 6, midMax: 2 << 30}, // every blob, up to the default MaxObjectSize
 }
 
 type benchItem interface{ itemName() string }
@@ -568,9 +579,9 @@ func (b *buildBencher) run(bc benchCase, cfg benchConfig, gen int, runName strin
 	}
 
 	b.results = append(b.results, res)
-	t.Logf("%s/%s/%s: %.1fs (drain %.1fs); gets %d, local hits %d, remote hits %d (inline %d, s3 %d), misses %d; puts %d",
+	t.Logf("%s/%s/%s: %.1fs (drain %.1fs); gets %d, local hits %d, remote hits %d (inline %d, mid %d, s3 %d), misses %d; puts %d",
 		bc.name, cfg.name, runName, res.WallSecs, res.DrainSecs, res.Gets, res.LocalHits, res.RemoteHits,
-		res.getTier("inline").Gets, res.getTier("s3").Gets, res.misses(), res.Puts)
+		res.getTier("inline").Gets, res.getTier("mid").Gets, res.getTier("s3").Gets, res.misses(), res.Puts)
 	if b.out != nil {
 		if err := b.out.Encode(res); err != nil {
 			t.Error(err)
@@ -679,8 +690,8 @@ func (b *buildBencher) printSummary() {
 		}
 		return fmt.Sprintf("%.1f", ls.P50*1000)
 	}
-	fmt.Fprintln(tw, "case\tconfig\trun\twall s\tdrain s\tgets\tlocal hits\tinline\ts3\tmisses\tuploads\t"+
-		"lookup p50 ms\tfirst byte p50 ms\ttransfer p50 ms\t")
+	fmt.Fprintln(tw, "case\tconfig\trun\twall s\tdrain s\tgets\tlocal hits\tinline\tmid\ts3\tmisses\tuploads\t"+
+		"lookup p50 ms\tmid first byte p50 ms\tmid transfer p50 ms\ts3 first byte p50 ms\ts3 transfer p50 ms\t")
 	for _, r := range b.results {
 		var uploads int64
 		if r.Stats != nil {
@@ -688,10 +699,12 @@ func (b *buildBencher) printSummary() {
 				uploads += ts.BlobUploads
 			}
 		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%.1f\t%.1f\t%d\t%d\t%d\t%d\t%d\t%d\t%s\t%s\t%s\t\n",
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%.1f\t%.1f\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%s\t%s\t%s\t%s\t%s\t\n",
 			r.Case, r.Config, r.Run, r.WallSecs, r.DrainSecs, r.Gets, r.LocalHits,
-			r.getTier("inline").Gets, r.getTier("s3").Gets, r.misses(), uploads,
-			ms(r.getPhase("s3", "lookup")), ms(r.getPhase("s3", "first_byte")), ms(r.getPhase("s3", "transfer")))
+			r.getTier("inline").Gets, r.getTier("mid").Gets, r.getTier("s3").Gets, r.misses(), uploads,
+			ms(r.getPhase("inline", "lookup")),
+			ms(r.getPhase("mid", "first_byte")), ms(r.getPhase("mid", "transfer")),
+			ms(r.getPhase("s3", "first_byte")), ms(r.getPhase("s3", "transfer")))
 	}
 	tw.Flush()
 
