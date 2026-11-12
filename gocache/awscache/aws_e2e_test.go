@@ -15,12 +15,24 @@ import (
 
 // TestRealAWS runs against a real DynamoDB table and S3 bucket, named by
 // $AWSCACHE_TEST_TABLE and $AWSCACHE_TEST_BUCKET, with credentials and
-// region from the environment as usual. It's skipped without them.
+// region from the environment as usual. It's skipped without them. If
+// $AWSCACHE_TEST_EXPRESS_BUCKET is also set, it runs again with that S3
+// Express One Zone directory bucket as the bucket.
 func TestRealAWS(t *testing.T) {
 	table, bucket := os.Getenv("AWSCACHE_TEST_TABLE"), os.Getenv("AWSCACHE_TEST_BUCKET")
 	if table == "" || bucket == "" {
 		t.Skip("AWSCACHE_TEST_TABLE and AWSCACHE_TEST_BUCKET not set")
 	}
+	buckets := []string{bucket}
+	if b := os.Getenv("AWSCACHE_TEST_EXPRESS_BUCKET"); b != "" {
+		buckets = append(buckets, b)
+	}
+	for _, bucket := range buckets {
+		t.Run(bucket, func(t *testing.T) { testRealAWS(t, table, bucket) })
+	}
+}
+
+func testRealAWS(t *testing.T, table, bucket string) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
 	c, err := New(ctx, Config{
@@ -41,7 +53,11 @@ func TestRealAWS(t *testing.T) {
 
 	ns := Namespace("awscache-test")
 	g := Grant{CanWrite: true, WriteNamespace: ns, ExtraReadNamespace: ns}
-	for _, size := range []int{0, 10, 1 << 20} {
+	for _, size := range []int{0, 10, 100 << 10, 1 << 20} {
+		wantStorage := "s3"
+		if size <= 700 {
+			wantStorage = "inline"
+		}
 		id := make([]byte, 32)
 		rand.Read(id)
 		action := hex.EncodeToString(id)
@@ -53,6 +69,9 @@ func TestRealAWS(t *testing.T) {
 		o, err := c.Get(ctx, g, action)
 		if err != nil || o == nil {
 			t.Fatalf("Get(%d bytes) = %v, %v", size, o, err)
+		}
+		if o.storage != wantStorage {
+			t.Errorf("Get(%d bytes) came from %q; want %q", size, o.storage, wantStorage)
 		}
 		var got bytes.Buffer
 		_, err = o.WriteTo(&got)
