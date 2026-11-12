@@ -184,12 +184,11 @@ func (h *Handler) serveGet(w http.ResponseWriter, r *http.Request) {
 	hdr.Set("Content-Type", "application/octet-stream")
 	hdr.Set("Go-Output-Id", o.OutputID)
 	var body io.WriterTo = o
-	if zr, zsize, ok := o.LZ4(); ok && requestAcceptsEncoding(r, "lz4") {
+	if zsize, ok := o.LZ4Size(); ok && requestAcceptsEncoding(r, "lz4") {
 		hdr.Set("Content-Encoding", "lz4")
 		hdr.Set("Content-Length", strconv.FormatInt(zsize, 10))
 		hdr.Set("X-Uncompressed-Length", strconv.FormatInt(o.Size, 10))
-		// The client checks the lz4 frame checksum.
-		body = readerWriterTo{zr}
+		body = writerToFunc(o.WriteLZ4To)
 	} else {
 		hdr.Set("Content-Length", strconv.FormatInt(o.Size, 10))
 	}
@@ -201,7 +200,10 @@ func (h *Handler) serveGet(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		// The headers are already sent. Abort the response, so that the
 		// client sees a broken body and discards it.
-		if r.Context().Err() == nil {
+		if errors.Is(err, errBadBlob) {
+			c.m.corruptBlobs.Inc()
+			c.logf("awscache: GET %s: %v", actionID, err)
+		} else if r.Context().Err() == nil {
 			c.logf("awscache: GET %s: writing response: %v", actionID, err)
 		}
 		typ = "error"
@@ -209,10 +211,10 @@ func (h *Handler) serveGet(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// readerWriterTo is an [io.WriterTo] that copies from r.
-type readerWriterTo struct{ r io.Reader }
+// writerToFunc is an [io.WriterTo] that calls itself.
+type writerToFunc func(io.Writer) (int64, error)
 
-func (rw readerWriterTo) WriteTo(w io.Writer) (int64, error) { return io.Copy(w, rw.r) }
+func (f writerToFunc) WriteTo(w io.Writer) (int64, error) { return f(w) }
 
 // PUT body read deadlines, as in gocached: a minimum upload rate plus a
 // flat grace, capped.

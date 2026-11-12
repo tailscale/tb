@@ -25,10 +25,18 @@
 // writer. Blobs are shared across namespaces and never overwritten (PUTs use
 // If-None-Match: *).
 //
-// GETs stream blobs from S3 to the client without checking their hash, as
-// the writer computed it. A blob of the wrong size is a miss. A blob with
-// damaged content fails its lz4 frame checksum, which makes the response
-// fail before its end, so the client discards it.
+// GETs stream blobs from S3 to the client, and check each blob's SHA-256 on
+// the way: they decompress it as they send it (or decompress a copy, if the
+// client accepts lz4), and hold back the last byte of the response until
+// the hash matches. A blob of the wrong size is a miss. A blob with other
+// content (damaged, or overwritten) makes the response fail before its end,
+// so the client discards it.
+//
+// The bucket may be an S3 Express One Zone directory bucket (a name ending
+// in "--x-s3"), whose time to first byte is much lower than S3 Standard's.
+// A directory bucket can't require If-None-Match: * on PUTs, so anything
+// with write access to it can overwrite a blob. The hash check on GET makes
+// an overwritten blob fail rather than serve other content.
 //
 // A PUT writes its blob before its metadata and returns once both are
 // durable, so an acknowledged PUT is readable from every host. The first PUT
@@ -143,7 +151,9 @@ type Config struct {
 	// that, EC2 instance metadata.
 	Region string
 
-	// Bucket is the S3 bucket holding blobs. Required.
+	// Bucket is the S3 bucket holding blobs. Required. It may be an S3
+	// Express One Zone directory bucket (a name ending in "--x-s3"), which
+	// should be in the same AZ as the clients.
 	Bucket string
 
 	// BlobPrefix is prepended to every S3 key, e.g. "v1/".
@@ -440,8 +450,9 @@ func (c *Cache) storageNS(ns Namespace) storageNS {
 
 // Object is a cache hit returned by [Cache.Get]. Callers must Close it.
 //
-// A blob's bytes stream from S3 as they're read, without a hash check (see
-// the package docs). Use only one of WriteTo and LZ4, once.
+// A blob's bytes stream from S3 as they're written. Its hash is checked on
+// the way, and the last byte is written only if the hash matches (see the
+// package docs). Use only one of WriteTo and WriteLZ4To, once.
 type Object struct {
 	// OutputID is the Go output ID (hex) stored with the action.
 	OutputID string
@@ -452,48 +463,137 @@ type Object struct {
 	inline   []byte        // if stored inline
 	blob     io.ReadCloser // else the lz4 blob
 	blobSize int64         // size of blob
+	sha256   string        // hex SHA-256 of the blob's uncompressed content
 
 	// storage is where the object came from: "inline" or "s3".
 	storage string
 }
 
+// errBadBlob is the error, wrapped, from [Object.WriteTo] and
+// [Object.WriteLZ4To] when the blob's content is bad, as opposed to an error
+// writing it.
+var errBadBlob = errors.New("bad blob")
+
 // WriteTo writes the object's uncompressed bytes to w.
 //
-// It writes the last byte only after the lz4 frame checksum is correct.
-// Thus a client that knows Size gets a short body if the blob is damaged.
+// For a blob, it writes the last byte only after the content's SHA-256
+// matches. Thus a client that knows Size gets a short body if the blob is
+// bad.
 func (o *Object) WriteTo(w io.Writer) (int64, error) {
 	if o.blob == nil {
 		n, err := w.Write(o.inline)
 		return int64(n), err
 	}
-	zr := lz4.NewReader(o.blob)
-	if o.Size == 0 {
-		_, err := io.Copy(io.Discard, zr)
-		return 0, err
+	hw := &holdBackWriter{w: w}
+	if err := o.check(o.blob, hw); err != nil {
+		return hw.n, o.blobError(hw, err)
 	}
-	n, err := io.CopyN(w, zr, o.Size-1)
-	if err != nil {
-		return n, err
-	}
-	var last [1]byte
-	if _, err := io.ReadFull(zr, last[:]); err != nil {
-		return n, err
-	}
-	// The frame checksum is checked at the end of the frame.
-	if _, err := io.ReadFull(zr, make([]byte, 1)); err != io.EOF {
-		return n, fmt.Errorf("lz4 blob doesn't end after %d bytes: %v", o.Size, err)
-	}
-	m, err := w.Write(last[:])
-	return n + int64(m), err
+	err := hw.flush()
+	return hw.n, err
 }
 
-// LZ4 returns a reader of the object as an lz4 frame and its size, if the
-// object is stored compressed. Otherwise it returns ok false.
-func (o *Object) LZ4() (r io.Reader, size int64, ok bool) {
+// LZ4Size returns the size of the object as an lz4 frame, if it's stored
+// compressed. Otherwise it returns ok false.
+func (o *Object) LZ4Size() (size int64, ok bool) {
 	if o.blob == nil {
-		return nil, 0, false
+		return 0, false
 	}
-	return o.blob, o.blobSize, true
+	return o.blobSize, true
+}
+
+// WriteLZ4To writes the object, which must be stored compressed (see
+// LZ4Size), to w as an lz4 frame.
+//
+// It writes the last byte only after the content's SHA-256 matches. Thus a
+// client that knows the size gets a short body if the blob is bad.
+func (o *Object) WriteLZ4To(w io.Writer) (int64, error) {
+	if o.blob == nil {
+		return 0, errors.New("object isn't stored compressed")
+	}
+	hw := &holdBackWriter{w: w}
+	if err := o.check(io.TeeReader(o.blob, hw), nil); err != nil {
+		return hw.n, o.blobError(hw, err)
+	}
+	if got := hw.n + int64(len(hw.last)); got != o.blobSize {
+		return hw.n, fmt.Errorf("%w: lz4 frame is %d bytes; want %d", errBadBlob, got, o.blobSize)
+	}
+	err := hw.flush()
+	return hw.n, err
+}
+
+// check decompresses the lz4 frame from src, writing the content to dst if
+// non-nil, and checks the content's size and SHA-256. Because the lz4
+// reader looks for another frame after the first one, it reads src to its
+// end.
+func (o *Object) check(src io.Reader, dst io.Writer) error {
+	h := sha256.New()
+	var out io.Writer = h
+	if dst != nil {
+		out = io.MultiWriter(dst, h)
+	}
+	n, err := io.Copy(out, io.LimitReader(lz4.NewReader(src), o.Size+1))
+	if err != nil {
+		return fmt.Errorf("decompressing: %w", err)
+	}
+	if n != o.Size {
+		return fmt.Errorf("decompressed to %d bytes; want %d", n, o.Size)
+	}
+	if got := hex.EncodeToString(h.Sum(nil)); got != o.sha256 {
+		return fmt.Errorf("content has sha256 %s; want %s", got, o.sha256)
+	}
+	return nil
+}
+
+// blobError returns err, from streaming the blob through hw, wrapped in
+// errBadBlob unless it came from writing to hw's writer.
+func (o *Object) blobError(hw *holdBackWriter, err error) error {
+	if hw.err != nil {
+		return hw.err
+	}
+	return fmt.Errorf("%w %s: %v", errBadBlob, o.sha256, err)
+}
+
+// holdBackWriter writes to w everything written to it but the last byte,
+// which it writes on flush.
+type holdBackWriter struct {
+	w    io.Writer
+	last []byte // the last byte written, if any, not yet written to w
+	n    int64  // bytes written to w
+	err  error  // the first error writing to w
+}
+
+func (h *holdBackWriter) Write(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	if err := h.write(h.last); err != nil {
+		return 0, err
+	}
+	if err := h.write(p[:len(p)-1]); err != nil {
+		return 0, err
+	}
+	h.last = append(h.last[:0], p[len(p)-1])
+	return len(p), nil
+}
+
+func (h *holdBackWriter) write(p []byte) error {
+	if h.err != nil {
+		return h.err
+	}
+	if len(p) == 0 {
+		return nil
+	}
+	n, err := h.w.Write(p)
+	h.n += int64(n)
+	h.err = err
+	return err
+}
+
+// flush writes the last byte.
+func (h *holdBackWriter) flush() error {
+	err := h.write(h.last)
+	h.last = nil
+	return err
 }
 
 // Close releases the object's resources.
@@ -524,7 +624,8 @@ func validHex(x string) bool {
 var ErrBadID = errors.New("awscache: malformed action or output ID")
 
 // Get looks up actionID in the namespaces g may read, returning (nil, nil)
-// on a miss. A hit's bytes stream from storage as they're read.
+// on a miss. A hit's bytes stream from storage as they're written, and
+// are checked on the way.
 func (c *Cache) Get(ctx context.Context, g Grant, actionID string) (*Object, error) {
 	o, _, err := c.get(ctx, g, actionID)
 	return o, err
@@ -566,6 +667,7 @@ func (c *Cache) get(ctx context.Context, g Grant, actionID string) (_ *Object, b
 		Size:     e.Size,
 		blob:     blob,
 		blobSize: e.StoredSize,
+		sha256:   e.SHA256,
 		storage:  "s3",
 	}, bumped, nil
 }

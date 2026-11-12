@@ -70,7 +70,7 @@ func newMetrics() *metrics {
 		}),
 		corruptBlobs: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "gocache_aws_corrupt_blobs_total",
-			Help: "gets whose blob in S3 wasn't the size its action said, served as misses; should be zero",
+			Help: "gets whose blob in S3 wasn't the size its action said (served as misses), or whose content failed its SHA-256 or lz4 checks while streaming (responses aborted before their last byte); should be zero",
 		}),
 		blobUploads: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "gocache_aws_blob_uploads_total",

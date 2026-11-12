@@ -19,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/pierrec/lz4/v4"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/tailscale/tb/gocache/cachers"
 )
@@ -436,51 +437,83 @@ func TestBadBlobs(t *testing.T) {
 	}
 }
 
-// TestDamagedBlob checks that a blob of the right size with damaged content
-// makes the response fail before its end, with and without lz4.
-func TestDamagedBlob(t *testing.T) {
-	env := newTestEnv(t)
-	c := env.newCache(nil)
-	cl := env.newClient(c, writeGlobal)
-	data := randBytes(1000)
-	cl.put("fafa01", "0f01", data)
+// TestBadBlobContent checks that a blob of the right size with other content
+// (damaged, or replaced by a valid lz4 frame of other content) makes the
+// response fail before its end, with and without lz4, so the client caches
+// nothing.
+func TestBadBlobContent(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		size  int
+		spoil func(blob []byte) []byte
+	}{
+		{"damaged-small", 1000, func(b []byte) []byte { b[len(b)/2] ^= 1; return b }},
+		{"damaged-large", 256 << 10, func(b []byte) []byte { b[len(b)/2] ^= 1; return b }},
+		// Random content is incompressible, so lz4 frames of the same
+		// amount of it are the same size, and the size check passes.
+		{"replaced-small", 1000, func(b []byte) []byte { return lz4Frame(t, randBytes(1000)) }},
+		{"replaced-large", 256 << 10, func(b []byte) []byte { return lz4Frame(t, randBytes(256<<10)) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			env := newTestEnv(t)
+			c := env.newCache(nil)
+			cl := env.newClient(c, writeGlobal)
+			data := randBytes(tc.size)
+			cl.put("fafa01", "0f01", data)
 
-	e, _ := env.meta.get(actionKey(c.globalNS, "fafa01"))
-	env.blobs.mu.Lock()
-	b := env.blobs.blobs[blobKey("pfx/", e.SHA256)]
-	b[len(b)/2] ^= 1
-	env.blobs.mu.Unlock()
+			e, _ := env.meta.get(actionKey(c.globalNS, "fafa01"))
+			env.blobs.mu.Lock()
+			bk := blobKey("pfx/", e.SHA256)
+			env.blobs.blobs[bk] = tc.spoil(env.blobs.blobs[bk])
+			if got := int64(len(env.blobs.blobs[bk])); got != e.StoredSize {
+				t.Fatalf("spoiled blob is %d bytes; want %d", got, e.StoredSize)
+			}
+			env.blobs.mu.Unlock()
 
-	// With lz4, the client's lz4 reader finds the damage.
-	dir := t.TempDir()
-	cl.hc.Disk = &cachers.DiskCache{Dir: dir}
-	if out, _, err := cl.hc.Get(context.Background(), "fafa01"); err == nil {
-		t.Errorf("lz4 Get = %q, nil; want error", out)
+			// With lz4.
+			dir := t.TempDir()
+			cl.hc.Disk = &cachers.DiskCache{Dir: dir}
+			if out, _, err := cl.hc.Get(context.Background(), "fafa01"); err == nil {
+				t.Errorf("lz4 Get = %q, nil; want error", out)
+			}
+			if ents, _ := os.ReadDir(filepath.Join(dir, "0f")); len(ents) != 0 {
+				t.Errorf("client cached %d files from a bad blob", len(ents))
+			}
+
+			// Without lz4. Small responses fail before their headers, as
+			// they're still buffered; large ones fail before their end.
+			req, _ := http.NewRequest("GET", cl.hc.BaseURL+"/action/fafa01", nil)
+			req.Header.Set("Want-Object", "1")
+			if res, err := http.DefaultClient.Do(req); err == nil {
+				got, err := io.ReadAll(res.Body)
+				res.Body.Close()
+				if err == nil || len(got) >= len(data) {
+					t.Errorf("plain GET read %d of %d bytes, err %v; want an error before the end", len(got), len(data), err)
+				}
+			}
+
+			st := cl.h.Stats()
+			if got := testutil.ToFloat64(c.m.corruptBlobs); got < 2 || int64(got) != st.GetErrs {
+				t.Errorf("corrupt blobs = %v, GetErrs = %d; want equal, and at least 2", got, st.GetErrs)
+			}
+		})
 	}
-	if ents, _ := os.ReadDir(filepath.Join(dir, "0f")); len(ents) != 0 {
-		t.Errorf("client cached %d files from a damaged blob", len(ents))
-	}
+}
 
-	// Without lz4, the server finds the damage and holds back the last byte.
-	req, _ := http.NewRequest("GET", cl.hc.BaseURL+"/action/fafa01", nil)
-	req.Header.Set("Want-Object", "1")
-	res, err := http.DefaultClient.Do(req)
-	if err != nil {
+// lz4Frame returns data as an lz4 frame, as Cache.Put writes it.
+func lz4Frame(t *testing.T, data []byte) []byte {
+	var buf bytes.Buffer
+	zw := lz4.NewWriter(&buf)
+	if err := zw.Apply(lz4.SizeOption(uint64(len(data)))); err != nil {
 		t.Fatal(err)
 	}
-	defer res.Body.Close()
-	got, err := io.ReadAll(res.Body)
-	if err == nil {
-		t.Errorf("plain GET read %d bytes with no error; want error", len(got))
+	if _, err := zw.Write(data); err != nil {
+		t.Fatal(err)
 	}
-	if len(got) >= len(data) {
-		t.Errorf("plain GET read %d bytes; want fewer than %d", len(got), len(data))
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
 	}
-	// Only the plain GET is a server error: with lz4, the server streamed
-	// the blob without error.
-	if st := cl.h.Stats(); st.GetErrs != 1 {
-		t.Errorf("GetErrs = %d; want 1", st.GetErrs)
-	}
+	return buf.Bytes()
 }
 
 func TestMetadataError(t *testing.T) {
