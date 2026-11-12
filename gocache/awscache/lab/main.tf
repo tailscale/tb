@@ -272,11 +272,12 @@ resource "aws_instance" "vm" {
     tailscale_ref = var.tailscale_ref
     test_env      = local.test_env
   })
-  user_data_replace_on_change = true
 
-  # A new AMI shouldn't replace the VM in the middle of an experiment.
+  # A new AMI or setup script shouldn't replace the VM in the middle of an
+  # experiment. (The setup script only runs at the first boot anyway.) To
+  # apply them, replace the VM: terraform apply -replace=aws_instance.vm.
   lifecycle {
-    ignore_changes = [ami]
+    ignore_changes = [ami, user_data]
   }
 
   tags = {
@@ -362,10 +363,11 @@ resource "aws_instance" "gocached" {
     repo_branch = var.repo_branch
     max_size_gb = var.gocached_max_size_gb
   })
-  user_data_replace_on_change = true
 
+  # As for the benchmark VM: to apply a new AMI or setup script, use
+  # terraform apply -replace='aws_instance.gocached[0]'.
   lifecycle {
-    ignore_changes = [ami]
+    ignore_changes = [ami, user_data]
   }
 
   tags = {
