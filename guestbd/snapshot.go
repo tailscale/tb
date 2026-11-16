@@ -28,13 +28,16 @@ type Snapshot struct {
 	mu           sync.Mutex
 	dirtyPages   map[int64]dirtyPageInfo // pageNum => dirty info
 	dirtyFile    *os.File                // temp file for dirty page data
-	nextDirtyNum int                     // monotonically increasing
+	nextDirtyNum int                     // next never-used slot in dirtyFile
+	freeSlots    []int                   // dirtyFile slots no longer referenced by dirtyPages
+	nextSeq      uint64                  // last dirtyPageInfo.seq assigned
 }
 
 // dirtyPageInfo tracks a written page in a snapshot.
 type dirtyPageInfo struct {
 	hash     pageHash
-	dirtyNum int // index into the snapshot's dirtyFile
+	dirtyNum int    // index into the snapshot's dirtyFile
+	seq      uint64 // unique per write; see readPageData
 }
 
 // newSnapshot creates a new Snapshot for the given read-only backing file.
@@ -80,18 +83,21 @@ func (c *Snapshot) readPageData(buf []byte, pageNum int64) error {
 	pageSize := c.server.pageSize
 	_ = buf[pageSize-1] // bounds check hint; panics if too small
 
-	c.mu.Lock()
-	dp, dirty := c.dirtyPages[pageNum]
-	c.mu.Unlock()
-
 	c.server.readPages.Add(1)
 
-	if dirty {
-		c.server.readPath.Add("from_write", 1)
+	for {
+		c.mu.Lock()
+		dp, dirty := c.dirtyPages[pageNum]
+		c.mu.Unlock()
+		if !dirty {
+			break
+		}
+
 		cache := c.server.cache
 		if cache != nil {
 			// Try the global cache first.
 			if data, ok := cache.Get(dp.hash); ok {
+				c.server.readPath.Add("from_write", 1)
 				copy(buf, data)
 				return nil
 			}
@@ -101,6 +107,21 @@ func (c *Snapshot) readPageData(buf []byte, pageNum int64) error {
 		if err != nil {
 			return fmt.Errorf("reading dirty page: %w", err)
 		}
+
+		// The read above was done without c.mu held, so a concurrent
+		// WriteAt or trim may have replaced this page and freed its slot
+		// for reuse by another write, leaving buf with the wrong
+		// contents. Slots are only freed when their page's entry
+		// changes, so an unchanged seq means buf is good. Otherwise,
+		// retry with the new entry.
+		c.mu.Lock()
+		cur, ok := c.dirtyPages[pageNum]
+		c.mu.Unlock()
+		if !ok || cur.seq != dp.seq {
+			continue
+		}
+
+		c.server.readPath.Add("from_write", 1)
 		if cache != nil {
 			cache.Put(dp.hash, buf[:pageSize])
 		}
@@ -199,19 +220,29 @@ func (c *Snapshot) WriteAt(p []byte, off int64) (int, error) {
 			h = hashPage(pageData)
 		}
 
+		// Write the page to a slot that no reader can see yet, then
+		// publish it and free the page's previous slot, if any.
 		c.mu.Lock()
-		dirtyNum := c.nextDirtyNum
-		c.nextDirtyNum++
+		dirtyNum := c.allocSlotLocked()
+		c.mu.Unlock()
 
 		_, err := c.dirtyFile.WriteAt(pageData, int64(dirtyNum)*int64(pageSize))
 		if err != nil {
+			c.mu.Lock()
+			c.freeSlots = append(c.freeSlots, dirtyNum)
 			c.mu.Unlock()
 			return int(pos), fmt.Errorf("writing dirty page: %w", err)
 		}
 
+		c.mu.Lock()
+		if old, ok := c.dirtyPages[pageNum]; ok {
+			c.freeSlots = append(c.freeSlots, old.dirtyNum)
+		}
+		c.nextSeq++
 		c.dirtyPages[pageNum] = dirtyPageInfo{
 			hash:     h,
 			dirtyNum: dirtyNum,
+			seq:      c.nextSeq,
 		}
 		c.mu.Unlock()
 
@@ -222,6 +253,21 @@ func (c *Snapshot) WriteAt(p []byte, off int64) (int, error) {
 		pos += n
 	}
 	return int(pos), nil
+}
+
+// allocSlotLocked returns a dirtyFile slot for a new page write, reusing a
+// freed slot if one is available so that dirtyFile's size is bounded by the
+// number of distinct dirty pages (plus writes in flight) rather than the
+// total number of writes. c.mu must be held.
+func (c *Snapshot) allocSlotLocked() int {
+	if n := len(c.freeSlots); n > 0 {
+		slot := c.freeSlots[n-1]
+		c.freeSlots = c.freeSlots[:n-1]
+		return slot
+	}
+	slot := c.nextDirtyNum
+	c.nextDirtyNum++
+	return slot
 }
 
 // WriteDirtyTo writes every page written to the snapshot, at its offset,
@@ -298,7 +344,10 @@ func (c *Snapshot) handleTrim(offset, length uint64) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for p := firstFullPage; p < lastFullPageExcl; p++ {
-		delete(c.dirtyPages, p)
+		if dp, ok := c.dirtyPages[p]; ok {
+			c.freeSlots = append(c.freeSlots, dp.dirtyNum)
+			delete(c.dirtyPages, p)
+		}
 	}
 	return nil
 }
