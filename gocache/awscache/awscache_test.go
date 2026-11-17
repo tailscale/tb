@@ -300,10 +300,10 @@ func TestRoundTrip(t *testing.T) {
 	}
 	reader.wantMiss("bbbb01")
 
-	if e, _ := env.meta.get(actionKey(globalStorageNS(0), "aaaa02")); !e.Inline || string(e.Data) != "small" {
+	if e, _ := env.meta.get(actionKey(actionKeyPrefix(0), globalStorageNS(0), "aaaa02")); !e.Inline || string(e.Data) != "small" {
 		t.Errorf("small object entry = %+v; want inline", e)
 	}
-	e, _ := env.meta.get(actionKey(globalStorageNS(0), "aaaa03"))
+	e, _ := env.meta.get(actionKey(actionKeyPrefix(0), globalStorageNS(0), "aaaa03"))
 	if e.Inline || e.StoredSize >= e.Size || len(e.SHA256) != 64 {
 		t.Errorf("compressible object entry = %+v; want compressed blob", e)
 	}
@@ -401,6 +401,22 @@ func TestNamespaces(t *testing.T) {
 	c2 := env.newCache(func(cfg *Config) { cfg.GlobalGeneration = 2 })
 	env.newClient(c2, Grant{}).wantMiss("cccc01")
 	env.newClient(c2, Grant{ExtraReadNamespace: "alice"}).wantHit("cccc01", "0a01", big)
+
+	// Bumping the generation starts every namespace afresh, but still
+	// shares blobs.
+	c3 := env.newCache(func(cfg *Config) { cfg.Generation = 2 })
+	env.newClient(c3, Grant{}).wantMiss("cccc01")
+	alice3 := env.newClient(c3, Grant{CanWrite: true, WriteNamespace: "alice", ExtraReadNamespace: "alice"})
+	alice3.wantMiss("cccc01")
+	alice3.put("cccc01", "0a03", big)
+	alice3.wantHit("cccc01", "0a03", big)
+	alice.wantHit("cccc01", "0b01", []byte("global"))
+	if _, ok := env.meta.get("a2#alice#cccc01"); !ok {
+		t.Errorf("generation 2 item not stored under its key prefix")
+	}
+	if puts, _, _ := env.blobs.counts(); puts != 1 {
+		t.Errorf("blob puts = %d; want 1", puts)
+	}
 }
 
 func TestReadOnly(t *testing.T) {
@@ -463,13 +479,13 @@ func TestBadBlobs(t *testing.T) {
 	cl.put("ffff02", "0f02", randBytes(1000))
 
 	// Truncate ffff01's blob.
-	e1, _ := env.meta.get(actionKey(c.globalNS, "ffff01"))
+	e1, _ := env.meta.get(c.actionKey(c.globalNS, "ffff01"))
 	env.blobs.mu.Lock()
 	bk := blobKey("pfx/", e1.SHA256)
 	env.blobs.blobs[bk] = env.blobs.blobs[bk][:10]
 
 	// Delete ffff02's blob, as the scrubber might.
-	e2, _ := env.meta.get(actionKey(c.globalNS, "ffff02"))
+	e2, _ := env.meta.get(c.actionKey(c.globalNS, "ffff02"))
 	delete(env.blobs.blobs, blobKey("pfx/", e2.SHA256))
 	env.blobs.mu.Unlock()
 
@@ -507,7 +523,7 @@ func TestBadBlobContent(t *testing.T) {
 			data := randBytes(tc.size)
 			cl.put("fafa01", "0f01", data)
 
-			e, _ := env.meta.get(actionKey(c.globalNS, "fafa01"))
+			e, _ := env.meta.get(c.actionKey(c.globalNS, "fafa01"))
 			env.blobs.mu.Lock()
 			bk := blobKey("pfx/", e.SHA256)
 			env.blobs.blobs[bk] = tc.spoil(env.blobs.blobs[bk])
@@ -628,7 +644,7 @@ func TestAccessTimeBump(t *testing.T) {
 	c := env.newCache(nil)
 	cl := env.newClient(c, writeGlobal)
 	cl.put("adad01", "0a01", []byte("x"))
-	key := actionKey(c.globalNS, "adad01")
+	key := c.actionKey(c.globalNS, "adad01")
 
 	// A fresh entry isn't bumped.
 	cl.wantHit("adad01", "0a01", []byte("x"))

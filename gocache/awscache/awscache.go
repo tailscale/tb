@@ -19,6 +19,9 @@
 // [Config.InlineMax]) or the SHA-256 and stored size of the object's blob in
 // S3. The global namespace is stored as "!global:<generation>", so bumping
 // [Config.GlobalGeneration] starts it afresh while the old items expire.
+// Similarly, bumping [Config.Generation] starts every namespace afresh: in
+// generations after the first, keys start with "a<generation>#" instead of
+// "a#".
 //
 // S3 holds lz4-compressed blobs at "<prefix><sha[:2]>/<sha>.lz4", content
 // addressed by the SHA-256 of the uncompressed bytes, computed by the
@@ -170,6 +173,13 @@ type Config struct {
 	// same.
 	GlobalGeneration int
 
+	// Generation is the generation of every namespace, including the
+	// global one. Incrementing it effectively wipes the whole cache, for
+	// example when moving to another blob bucket; the old generation's
+	// items expire through TTL. Generations 0 and 1 are the same. Blobs are
+	// shared between generations.
+	Generation int
+
 	// ConsistentReads makes action lookups strongly consistent, at twice
 	// the read cost. Eventually consistent reads are almost always fresh
 	// within a second, which is plenty for a cache.
@@ -245,6 +255,7 @@ type Cache struct {
 	blobs    blobStore
 	checks   []func(context.Context) error
 	globalNS storageNS
+	keyPfx   string // of action keys, from Config.Generation
 	bumper   *atimeBumper
 	memSem   *semaphore.Weighted
 	diskSem  *semaphore.Weighted
@@ -299,6 +310,7 @@ func New(ctx context.Context, cfg Config) (*Cache, error) {
 		blobs:      cfg.blobs,
 		checks:     checks,
 		globalNS:   globalStorageNS(cfg.GlobalGeneration),
+		keyPfx:     actionKeyPrefix(cfg.Generation),
 		memSem:     semaphore.NewWeighted(cfg.MemBudget),
 		diskSem:    semaphore.NewWeighted(max(cfg.SpoolCap, 1)),
 		knownBlobs: &lru.Cache[string, bool]{MaxEntries: cfg.KnownBlobs},
@@ -363,8 +375,8 @@ func (cfg *Config) fillDefaults() error {
 		return fmt.Errorf("awscache: MaxObjectSize %d must exceed InlineMax %d", cfg.MaxObjectSize, cfg.InlineMax)
 	case cfg.MaxObjectSize > 5<<30:
 		return fmt.Errorf("awscache: MaxObjectSize %d exceeds S3's 5GiB single PUT limit", cfg.MaxObjectSize)
-	case cfg.MemBudget < 0, cfg.SpoolCap < 0, cfg.Retention < 0, cfg.Relatime < 0, cfg.GlobalGeneration < 0:
-		return errors.New("awscache: MemBudget, SpoolCap, Retention, Relatime, and GlobalGeneration must not be negative")
+	case cfg.MemBudget < 0, cfg.SpoolCap < 0, cfg.Retention < 0, cfg.Relatime < 0, cfg.GlobalGeneration < 0, cfg.Generation < 0:
+		return errors.New("awscache: MemBudget, SpoolCap, Retention, Relatime, GlobalGeneration, and Generation must not be negative")
 	case cfg.Relatime >= cfg.Retention:
 		return fmt.Errorf("awscache: Relatime %v must be less than Retention %v", cfg.Relatime, cfg.Retention)
 	}
@@ -434,6 +446,12 @@ func (c *Cache) Close(ctx context.Context) error {
 		c.drainCancel()
 	})
 	return nil
+}
+
+// actionKey returns the metaStore key for actionID in namespace ns, in
+// c's generation.
+func (c *Cache) actionKey(ns storageNS, actionID string) string {
+	return actionKey(c.keyPfx, ns, actionID)
 }
 
 // storageNS returns the storage namespace for ns.
@@ -683,12 +701,12 @@ func (c *Cache) get(ctx context.Context, g Grant, actionID string, tm *getTiming
 // extra read namespace, querying both concurrently. It returns the key of
 // the hit, or a nil entry on a miss.
 func (c *Cache) lookupAction(ctx context.Context, g Grant, actionID string) (key string, e *actionEntry, err error) {
-	globalKey := actionKey(c.globalNS, actionID)
+	globalKey := c.actionKey(c.globalNS, actionID)
 	if g.ExtraReadNamespace == GlobalNamespace {
 		e, err := c.meta.GetAction(ctx, globalKey)
 		return globalKey, e, err
 	}
-	extraKey := actionKey(c.storageNS(g.ExtraReadNamespace), actionID)
+	extraKey := c.actionKey(c.storageNS(g.ExtraReadNamespace), actionID)
 
 	var extra *actionEntry
 	var extraErr error
@@ -809,7 +827,7 @@ func (c *Cache) put(ctx context.Context, g Grant, actionID, outputID string, siz
 	if size > c.cfg.MaxObjectSize {
 		return putResult{}, ErrTooLarge
 	}
-	key := actionKey(c.storageNS(g.WriteNamespace), actionID)
+	key := c.actionKey(c.storageNS(g.WriteNamespace), actionID)
 
 	// Most PUTs in CI are for actions some earlier job already stored, so
 	// check before doing any work.

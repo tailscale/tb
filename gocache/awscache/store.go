@@ -88,10 +88,17 @@ type blobStore interface {
 	Get(ctx context.Context, key string) (_ io.ReadCloser, size int64, _ error)
 }
 
-// Item key prefixes in the single DynamoDB table. The separator '#' and the
-// '!' that starts global namespace names are outside the namespace character
-// set (see [ValidateNamespace]), so keys can't collide.
-const actionKeyPrefix = "a#"
+// actionKeyPrefix returns the prefix of action item keys in generation gen
+// of the cache (see [Config.Generation]): "a#" in generations 0 and 1, and
+// "a<gen>#" after. The separator '#' and the '!' that starts global
+// namespace names are outside the namespace character set (see
+// [ValidateNamespace]), so keys can't collide.
+func actionKeyPrefix(gen int) string {
+	if gen <= 1 {
+		return "a#"
+	}
+	return "a" + strconv.Itoa(gen) + "#"
+}
 
 // storageNS is a namespace name as used in storage keys: either a validated
 // [Namespace] or the synthetic name of a global generation.
@@ -103,9 +110,10 @@ func globalStorageNS(gen int) storageNS {
 	return storageNS("!global:" + strconv.Itoa(max(gen, 1)))
 }
 
-// actionKey returns the metaStore key for actionID in namespace ns.
-func actionKey(ns storageNS, actionID string) string {
-	return actionKeyPrefix + string(ns) + "#" + actionID
+// actionKey returns the metaStore key for actionID in namespace ns, with
+// the given [actionKeyPrefix].
+func actionKey(prefix string, ns storageNS, actionID string) string {
+	return prefix + string(ns) + "#" + actionID
 }
 
 // blobKey returns the blobStore key for the lz4-compressed blob with the
