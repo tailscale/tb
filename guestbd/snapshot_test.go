@@ -151,9 +151,53 @@ func TestDirtySlotReuseConcurrent(t *testing.T) {
 			close(done)
 			readers.Wait()
 
-			if got, max := dirtyFileSize(t, snap), int64(2*pages*pageSize); got > max {
+			// Slots in use are at most one live slot per page, plus one
+			// unpublished slot per writer, plus one pinned slot per
+			// reader.
+			if got, max := dirtyFileSize(t, snap), int64(3*pages*pageSize); got > max {
 				t.Errorf("dirty file is %d bytes; want <= %d", got, max)
 			}
 		})
+	}
+}
+
+// TestPinnedSlotNotReused checks that a dirty file slot freed while a
+// reader has it pinned isn't reused until the reader unpins it.
+func TestPinnedSlotNotReused(t *testing.T) {
+	const pageSize = 4096
+	snap := newTestSnapshot(t, pageSize, 4, false)
+
+	page := make([]byte, pageSize)
+	if _, err := snap.WriteAt(page, 0); err != nil {
+		t.Fatal(err)
+	}
+	snap.mu.Lock()
+	slot := snap.dirtyPages[0].dirtyNum
+	snap.slots[slot].readers++ // as readPageData does
+	snap.mu.Unlock()
+
+	// Rewriting page 0 frees its old slot, but the pin must keep the
+	// next write from reusing it.
+	for p := range int64(2) {
+		if _, err := snap.WriteAt(page, p*pageSize); err != nil {
+			t.Fatal(err)
+		}
+		snap.mu.Lock()
+		got := snap.dirtyPages[p].dirtyNum
+		snap.mu.Unlock()
+		if got == slot {
+			t.Fatalf("write to page %d reused pinned slot %d", p, slot)
+		}
+	}
+
+	snap.unpinSlot(slot)
+	if _, err := snap.WriteAt(page, 2*pageSize); err != nil {
+		t.Fatal(err)
+	}
+	snap.mu.Lock()
+	got := snap.dirtyPages[2].dirtyNum
+	snap.mu.Unlock()
+	if got != slot {
+		t.Errorf("write after unpin got slot %d; want reused slot %d", got, slot)
 	}
 }

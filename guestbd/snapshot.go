@@ -29,15 +29,24 @@ type Snapshot struct {
 	dirtyPages   map[int64]dirtyPageInfo // pageNum => dirty info
 	dirtyFile    *os.File                // temp file for dirty page data
 	nextDirtyNum int                     // next never-used slot in dirtyFile
-	freeSlots    []int                   // dirtyFile slots no longer referenced by dirtyPages
-	nextSeq      uint64                  // last dirtyPageInfo.seq assigned
+	freeSlots    []int                   // dirtyFile slots available for reuse
+	slots        []slotState             // by dirtyFile slot, for slots < nextDirtyNum
 }
 
 // dirtyPageInfo tracks a written page in a snapshot.
 type dirtyPageInfo struct {
 	hash     pageHash
-	dirtyNum int    // index into the snapshot's dirtyFile
-	seq      uint64 // unique per write; see readPageData
+	dirtyNum int // index into the snapshot's dirtyFile
+}
+
+// slotState tracks the readers of a dirtyFile slot.
+//
+// readPageData reads a slot without holding Snapshot.mu, so it pins the
+// slot while reading to keep a concurrent WriteAt or trim from freeing the
+// slot and letting another write overwrite it mid-read.
+type slotState struct {
+	readers int  // readPageData calls currently reading this slot
+	freed   bool // freed while pinned; goes to freeSlots when readers hits 0
 }
 
 // newSnapshot creates a new Snapshot for the given read-only backing file.
@@ -85,43 +94,31 @@ func (c *Snapshot) readPageData(buf []byte, pageNum int64) error {
 
 	c.server.readPages.Add(1)
 
-	for {
-		c.mu.Lock()
-		dp, dirty := c.dirtyPages[pageNum]
-		c.mu.Unlock()
-		if !dirty {
-			break
-		}
+	c.mu.Lock()
+	dp, dirty := c.dirtyPages[pageNum]
+	if dirty {
+		c.slots[dp.dirtyNum].readers++
+	}
+	c.mu.Unlock()
 
+	if dirty {
+		defer c.unpinSlot(dp.dirtyNum)
+		c.server.readPath.Add("from_write", 1)
 		cache := c.server.cache
 		if cache != nil {
 			// Try the global cache first.
 			if data, ok := cache.Get(dp.hash); ok {
-				c.server.readPath.Add("from_write", 1)
 				copy(buf, data)
 				return nil
 			}
 		}
-		// Read from the snapshot's dirty file.
+		// Read from the snapshot's dirty file. If the page is rewritten
+		// meanwhile, this returns its contents from when the read began,
+		// which still match dp.hash.
 		_, err := c.dirtyFile.ReadAt(buf[:pageSize], int64(dp.dirtyNum)*int64(pageSize))
 		if err != nil {
 			return fmt.Errorf("reading dirty page: %w", err)
 		}
-
-		// The read above was done without c.mu held, so a concurrent
-		// WriteAt or trim may have replaced this page and freed its slot
-		// for reuse by another write, leaving buf with the wrong
-		// contents. Slots are only freed when their page's entry
-		// changes, so an unchanged seq means buf is good. Otherwise,
-		// retry with the new entry.
-		c.mu.Lock()
-		cur, ok := c.dirtyPages[pageNum]
-		c.mu.Unlock()
-		if !ok || cur.seq != dp.seq {
-			continue
-		}
-
-		c.server.readPath.Add("from_write", 1)
 		if cache != nil {
 			cache.Put(dp.hash, buf[:pageSize])
 		}
@@ -229,20 +226,18 @@ func (c *Snapshot) WriteAt(p []byte, off int64) (int, error) {
 		_, err := c.dirtyFile.WriteAt(pageData, int64(dirtyNum)*int64(pageSize))
 		if err != nil {
 			c.mu.Lock()
-			c.freeSlots = append(c.freeSlots, dirtyNum)
+			c.freeSlotLocked(dirtyNum)
 			c.mu.Unlock()
 			return int(pos), fmt.Errorf("writing dirty page: %w", err)
 		}
 
 		c.mu.Lock()
 		if old, ok := c.dirtyPages[pageNum]; ok {
-			c.freeSlots = append(c.freeSlots, old.dirtyNum)
+			c.freeSlotLocked(old.dirtyNum)
 		}
-		c.nextSeq++
 		c.dirtyPages[pageNum] = dirtyPageInfo{
 			hash:     h,
 			dirtyNum: dirtyNum,
-			seq:      c.nextSeq,
 		}
 		c.mu.Unlock()
 
@@ -257,8 +252,8 @@ func (c *Snapshot) WriteAt(p []byte, off int64) (int, error) {
 
 // allocSlotLocked returns a dirtyFile slot for a new page write, reusing a
 // freed slot if one is available so that dirtyFile's size is bounded by the
-// number of distinct dirty pages (plus writes in flight) rather than the
-// total number of writes. c.mu must be held.
+// number of distinct dirty pages (plus writes and reads in flight) rather
+// than the total number of writes. c.mu must be held.
 func (c *Snapshot) allocSlotLocked() int {
 	if n := len(c.freeSlots); n > 0 {
 		slot := c.freeSlots[n-1]
@@ -267,7 +262,32 @@ func (c *Snapshot) allocSlotLocked() int {
 	}
 	slot := c.nextDirtyNum
 	c.nextDirtyNum++
+	c.slots = append(c.slots, slotState{})
 	return slot
+}
+
+// freeSlotLocked marks a dirtyFile slot as no longer referenced by
+// dirtyPages. The slot becomes available for reuse once no readers have it
+// pinned. c.mu must be held.
+func (c *Snapshot) freeSlotLocked(slot int) {
+	if c.slots[slot].readers > 0 {
+		c.slots[slot].freed = true
+		return
+	}
+	c.freeSlots = append(c.freeSlots, slot)
+}
+
+// unpinSlot releases a slot pinned by readPageData, completing a deferred
+// free if this was the last reader.
+func (c *Snapshot) unpinSlot(slot int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	st := &c.slots[slot]
+	st.readers--
+	if st.readers == 0 && st.freed {
+		st.freed = false
+		c.freeSlots = append(c.freeSlots, slot)
+	}
 }
 
 // WriteDirtyTo writes every page written to the snapshot, at its offset,
@@ -345,7 +365,7 @@ func (c *Snapshot) handleTrim(offset, length uint64) error {
 	defer c.mu.Unlock()
 	for p := firstFullPage; p < lastFullPageExcl; p++ {
 		if dp, ok := c.dirtyPages[p]; ok {
-			c.freeSlots = append(c.freeSlots, dp.dirtyNum)
+			c.freeSlotLocked(dp.dirtyNum)
 			delete(c.dirtyPages, p)
 		}
 	}
