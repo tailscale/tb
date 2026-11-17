@@ -3,6 +3,7 @@ package guestbd
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -199,5 +200,55 @@ func TestPinnedSlotNotReused(t *testing.T) {
 	snap.mu.Unlock()
 	if got != slot {
 		t.Errorf("write after unpin got slot %d; want reused slot %d", got, slot)
+	}
+}
+
+// TestCloseDuringIO checks that closing a snapshot while reads and writes
+// are in flight makes them fail cleanly, without a data race, and that
+// closing it twice releases its base image only once.
+func TestCloseDuringIO(t *testing.T) {
+	const pageSize = 4096
+	snap := newTestSnapshot(t, pageSize, 4, false)
+	srv := snap.server
+
+	// A second snapshot shares the base image, so a double release by
+	// snap would mark the base image inactive while other still uses it.
+	other, err := srv.NewSnapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Close()
+
+	page := make([]byte, pageSize)
+	if _, err := snap.WriteAt(page, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	var wg sync.WaitGroup
+	for range 4 {
+		wg.Go(func() {
+			buf := make([]byte, pageSize)
+			for {
+				if _, err := snap.WriteAt(buf, 0); err != nil {
+					if !errors.Is(err, os.ErrClosed) {
+						t.Errorf("WriteAt: got %v; want os.ErrClosed", err)
+					}
+					return
+				}
+				if _, err := snap.ReadAt(buf, 0); err != nil {
+					if !errors.Is(err, os.ErrClosed) {
+						t.Errorf("ReadAt: got %v; want os.ErrClosed", err)
+					}
+					return
+				}
+			}
+		})
+	}
+	snap.Close()
+	wg.Wait()
+
+	snap.Close()
+	if got := srv.baseImagesActive.Value(); got != 1 {
+		t.Errorf("after closing one of two snapshots twice, %d base images active; want 1", got)
 	}
 }

@@ -26,8 +26,9 @@ type Snapshot struct {
 	roFile *baseImageState
 
 	mu           sync.Mutex
+	closed       bool                    // Close has been called
 	dirtyPages   map[int64]dirtyPageInfo // pageNum => dirty info
-	dirtyFile    *os.File                // temp file for dirty page data
+	dirtyFile    *os.File                // temp file for dirty page data; immutable
 	nextDirtyNum int                     // next never-used slot in dirtyFile
 	freeSlots    []int                   // dirtyFile slots available for reuse
 	slots        []slotState             // by dirtyFile slot, for slots < nextDirtyNum
@@ -69,13 +70,20 @@ func newSnapshot(srv *Server, ro *baseImageState) (*Snapshot, error) {
 
 // Close releases the snapshot's dirty page storage and unregisters it from
 // the server. It does not close any TCP connection using the snapshot.
+// Reads and writes of dirty pages after or during Close fail. Calls after
+// the first do nothing.
 func (c *Snapshot) Close() error {
 	c.mu.Lock()
-	if c.dirtyFile != nil {
-		c.dirtyFile.Close()
-		c.dirtyFile = nil
+	if c.closed {
+		c.mu.Unlock()
+		return nil
 	}
+	c.closed = true
 	c.mu.Unlock()
+
+	// dirtyFile is never reassigned, and os.File allows Close concurrent
+	// with ReadAt and WriteAt, which then fail with os.ErrClosed.
+	c.dirtyFile.Close()
 
 	c.server.mu.Lock()
 	c.server.snapshots.Delete(c)
