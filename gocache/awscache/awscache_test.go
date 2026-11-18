@@ -130,15 +130,15 @@ func (f *fakeBlobs) Put(ctx context.Context, key string, r io.ReadSeeker, size i
 	return nil
 }
 
-func (f *fakeBlobs) Get(ctx context.Context, key string) (io.ReadCloser, error) {
+func (f *fakeBlobs) Get(ctx context.Context, key string) (io.ReadCloser, int64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.gets++
 	b, ok := f.blobs[key]
 	if !ok {
-		return nil, errBlobNotFound
+		return nil, 0, ErrBlobNotFound
 	}
-	return io.NopCloser(bytes.NewReader(b)), nil
+	return io.NopCloser(bytes.NewReader(b)), int64(len(b)), nil
 }
 
 func (f *fakeBlobs) counts() (puts, heads, gets int) {
@@ -205,6 +205,20 @@ func (env *testEnv) newCache(modify func(*Config)) *Cache {
 	}
 	t.Cleanup(func() { c.Close(context.Background()) })
 	return c
+}
+
+// putBlob stores data as the output of actionID in the global namespace of
+// c, and returns its entry. The data must be large enough to be a blob.
+func (env *testEnv) putBlob(c *Cache, actionID string, data []byte) actionEntry {
+	env.t.Helper()
+	if err := c.Put(context.Background(), writeGlobal, actionID, "0b"+actionID, int64(len(data)), bytes.NewReader(data)); err != nil {
+		env.t.Fatal(err)
+	}
+	e, ok := env.meta.get(actionKey(c.globalNS, actionID))
+	if !ok || e.Inline {
+		env.t.Fatalf("%s: entry %+v; want a blob", actionID, e)
+	}
+	return e
 }
 
 // client is a cigocacher-like client of a Handler.

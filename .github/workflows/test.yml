@@ -24,9 +24,10 @@ jobs:
           cache: false
       - run: go test ./...
 
-  # aws-emulator runs the tests that need AWS (such as TestRealAWS in
-  # gocache/awscache) against AWS Emulator (https://github.com/aws/aws-emulator),
-  # a local emulator of the AWS APIs. This job uses no AWS account.
+  # aws-emulator runs the tests that need AWS against AWS Emulator.
+  # It runs every test, in every package, whose name starts with TestRealAWS.
+  # Such a test must skip itself if AWSCACHE_TEST_TABLE or
+  # AWSCACHE_TEST_BUCKET isn't set, so that the test job above skips it.
   aws-emulator:
     runs-on: ubuntu-latest
     env:
@@ -87,7 +88,7 @@ jobs:
             --time-to-live-specification Enabled=true,AttributeName=ttl
           aws s3api create-bucket --bucket "$AWSCACHE_TEST_BUCKET"
       - name: Test
-        run: go test -run 'TestRealAWS' -count=1 -v ./...
+        run: go test -run '^TestRealAWS' -count=1 -v ./...
       - name: Show AWS Emulator log
         if: always()
         run: cat "$RUNNER_TEMP/aws-emulator.log" || true
