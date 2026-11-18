@@ -69,8 +69,9 @@ type metaStore interface {
 	BumpAccessTime(ctx context.Context, key string, now, ttl, olderThan int64) error
 }
 
-// errBlobNotFound is returned by [blobStore.Get] for a missing blob.
-var errBlobNotFound = errors.New("blob not found")
+// ErrBlobNotFound is the error for a blob that isn't in S3. [S3Blobs.Get]
+// returns it, and so does [blobStore.Get].
+var ErrBlobNotFound = errors.New("blob not found")
 
 // blobStore is the durable content-addressed object store shared by every
 // client. In production it's S3 ([s3Store]).
@@ -83,9 +84,9 @@ type blobStore interface {
 	// the existing blob in place.
 	Put(ctx context.Context, key string, r io.ReadSeeker, size int64) error
 
-	// Get opens the blob at key, returning [errBlobNotFound] if it doesn't
-	// exist.
-	Get(ctx context.Context, key string) (io.ReadCloser, error)
+	// Get opens the blob at key and returns its size. It returns
+	// [ErrBlobNotFound] if the blob doesn't exist.
+	Get(ctx context.Context, key string) (_ io.ReadCloser, size int64, _ error)
 }
 
 // Item key prefixes in the single DynamoDB table. The separator '#' and the
@@ -411,19 +412,29 @@ func (s *s3Store) Put(ctx context.Context, key string, r io.ReadSeeker, size int
 	return err
 }
 
-func (s *s3Store) Get(ctx context.Context, key string) (_ io.ReadCloser, retErr error) {
+func (s *s3Store) Get(ctx context.Context, key string) (_ io.ReadCloser, size int64, retErr error) {
 	start := time.Now()
 	result := "ok"
 	// This measures time to first byte; the body streams afterwards.
 	defer func() { s.m.observeOp("s3", "GetObject", cmpResult(result, retErr), start) }()
-	out, err := s.c.GetObject(ctx, &s3.GetObjectInput{Bucket: &s.bucket, Key: &key})
+	out, err := s.c.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: &s.bucket,
+		Key:    &key,
+		// This defaults on, but set it explicitly too as the blob server does
+		// no checksumming of its own.
+		ChecksumMode: s3types.ChecksumModeEnabled,
+	})
 	if err != nil {
 		var nsk *s3types.NoSuchKey
 		if errors.As(err, &nsk) || isHTTPStatus(err, http.StatusNotFound) {
 			result = "miss"
-			return nil, errBlobNotFound
+			return nil, 0, ErrBlobNotFound
 		}
-		return nil, err
+		return nil, 0, err
 	}
-	return out.Body, nil
+	if out.ContentLength == nil {
+		out.Body.Close()
+		return nil, 0, fmt.Errorf("GetObject %s: no Content-Length", key)
+	}
+	return out.Body, *out.ContentLength, nil
 }

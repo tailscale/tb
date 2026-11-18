@@ -235,7 +235,7 @@ type Cache struct {
 	now      func() time.Time
 	m        *metrics
 	meta     metaStore
-	blobs    blobStore
+	s3blobs  *S3Blobs
 	checks   []func(context.Context) error
 	globalNS storageNS
 	bumper   *atimeBumper
@@ -287,7 +287,7 @@ func New(ctx context.Context, cfg Config) (*Cache, error) {
 		now:        cfg.now,
 		m:          m,
 		meta:       cfg.meta,
-		blobs:      cfg.blobs,
+		s3blobs:    newS3Blobs(cfg.blobs, cfg.BlobPrefix, m),
 		checks:     checks,
 		globalNS:   globalStorageNS(cfg.GlobalGeneration),
 		memSem:     semaphore.NewWeighted(cfg.MemBudget),
@@ -592,8 +592,8 @@ func (c *Cache) fetchBlob(ctx context.Context, key string, e *actionEntry) (*spo
 	// TODO(bradfitz): first try the optional same-AZ read-through NVMe
 	// cache pool (see Config), hedging to S3 directly if the pool doesn't
 	// start answering quickly. Until then, every blob GET goes to S3.
-	rc, err := c.blobs.Get(ctx, blobKey(c.cfg.BlobPrefix, e.SHA256))
-	if errors.Is(err, errBlobNotFound) {
+	rc, _, err := c.s3blobs.Get(ctx, e.SHA256)
+	if errors.Is(err, ErrBlobNotFound) {
 		// PUT writes the blob before the action, so this means the
 		// scrubber deleted the blob after this action's last use. Treat it
 		// as a miss; the next PUT of the action can't repair it (the first
@@ -784,14 +784,13 @@ func (c *Cache) storeBlob(ctx context.Context, key string, e *actionEntry, body 
 
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), putStoreTimeout(e.Size))
 	defer cancel()
-	bk := blobKey(c.cfg.BlobPrefix, e.SHA256)
-	if c.blobKnown(bk) {
+	if c.blobKnown(e.SHA256) {
 		c.m.blobSkips.WithLabelValues("known").Inc()
 		return nil
 	}
 	// TODO(bradfitz): ask the optional NVMe cache pool before S3, which
 	// would usually know about recently written blobs.
-	exists, err := c.blobs.Exists(ctx, bk)
+	exists, err := c.s3blobs.exists(ctx, e.SHA256)
 	if err != nil {
 		// Not fatal: an upload is still correct.
 		c.logf("awscache: PUT %s: checking for blob %s: %v", key, e.SHA256, err)
@@ -803,30 +802,30 @@ func (c *Cache) storeBlob(ctx context.Context, key string, e *actionEntry, body 
 		if err != nil {
 			return err
 		}
-		if err := c.blobs.Put(ctx, bk, r, e.StoredSize); err != nil {
+		if err := c.s3blobs.put(ctx, e.SHA256, r, e.StoredSize); err != nil {
 			return fmt.Errorf("uploading blob %s: %w", e.SHA256, err)
 		}
 		c.m.blobUploads.Inc()
 		c.m.blobUploadBytes.Add(float64(e.StoredSize))
 	}
-	c.noteBlobKnown(bk)
+	c.noteBlobKnown(e.SHA256)
 	return nil
 }
 
-// blobKnown reports whether this process recently saw blob key bk exist.
+// blobKnown reports whether this process recently saw the blob sha exist.
 //
 // This relies on the scrubber only deleting blobs that no action has
 // referenced for far longer than a Cache lives.
-func (c *Cache) blobKnown(bk string) bool {
+func (c *Cache) blobKnown(sha string) bool {
 	c.knownMu.Lock()
 	defer c.knownMu.Unlock()
-	return c.knownBlobs.Contains(bk)
+	return c.knownBlobs.Contains(sha)
 }
 
-func (c *Cache) noteBlobKnown(bk string) {
+func (c *Cache) noteBlobKnown(sha string) {
 	c.knownMu.Lock()
 	defer c.knownMu.Unlock()
-	c.knownBlobs.Set(bk, true)
+	c.knownBlobs.Set(sha, true)
 }
 
 func logPrintf(format string, args ...any) { log.Printf(format, args...) }
