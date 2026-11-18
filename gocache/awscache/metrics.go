@@ -21,6 +21,7 @@ type metrics struct {
 	activePuts      prometheus.Gauge
 	danglingActions prometheus.Counter
 	corruptBlobs    prometheus.Counter
+	poolFallbacks   *prometheus.CounterVec
 	blobUploads     prometheus.Counter
 	blobUploadBytes prometheus.Counter
 	blobSkips       *prometheus.CounterVec // how
@@ -43,7 +44,7 @@ func newMetrics() *metrics {
 		}, []string{"service", "op", "result"}),
 		getDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Name:    "gocache_aws_get_duration_seconds",
-			Help:    "wall time of each cache get, labeled by storage (inline, s3, or none) and type (hit, miss, or error)",
+			Help:    "wall time of each cache get, labeled by storage (inline, blobserver, s3, or none) and type (hit, miss, or error)",
 			Buckets: latencyBuckets,
 		}, []string{"storage", "type"}),
 		putDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
@@ -72,6 +73,10 @@ func newMetrics() *metrics {
 			Name: "gocache_aws_corrupt_blobs_total",
 			Help: "gets whose blob failed to decompress or didn't match its SHA-256 or size, served as misses; should be zero",
 		}),
+		poolFallbacks: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "gocache_aws_blob_server_fallbacks_total",
+			Help: "blob gets that went to S3 because the blob server didn't have the blob or failed, labeled by reason: miss (not on the server), down (recently unreachable), error, or corrupt",
+		}, []string{"reason"}),
 		blobUploads: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "gocache_aws_blob_uploads_total",
 			Help: "blobs uploaded to S3",
@@ -82,7 +87,7 @@ func newMetrics() *metrics {
 		}),
 		blobSkips: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "gocache_aws_blob_upload_skips_total",
-			Help: "puts of blob-sized objects whose blob was already in S3, so not uploaded; labeled by how that was known: known (this process saw it recently) or head (S3 HeadObject)",
+			Help: "puts of blob-sized objects whose blob was already in S3, so not uploaded; labeled by how that was known: known (this process saw it recently), blobserver (a blob server has it), or head (S3 HeadObject)",
 		}, []string{"how"}),
 		spoolBytes: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "gocache_aws_spool_reserved_bytes",
@@ -115,6 +120,7 @@ func (m *metrics) collectors() []prometheus.Collector {
 	return []prometheus.Collector{
 		m.opDuration, m.getDuration, m.putDuration, m.objectBytes,
 		m.activeGets, m.activePuts, m.danglingActions, m.corruptBlobs,
+		m.poolFallbacks,
 		m.blobUploads, m.blobUploadBytes, m.blobSkips, m.spoolBytes,
 		m.spoolBlocked, m.atimeQueued, m.atimeDropped, m.atimeBumps,
 		m.atimeErrs,

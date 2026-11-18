@@ -92,9 +92,6 @@ type blobStore interface {
 // Item key prefixes in the single DynamoDB table. The separator '#' and the
 // '!' that starts global namespace names are outside the namespace character
 // set (see [ValidateNamespace]), so keys can't collide.
-//
-// TODO(bradfitz): "m#cache#<az>" items listing the members of the optional
-// read-through NVMe blob cache pool, per ci/doc/aws-native-gocached.md.
 const actionKeyPrefix = "a#"
 
 // storageNS is a namespace name as used in storage keys: either a validated
