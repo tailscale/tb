@@ -37,7 +37,9 @@
 // unused for [Config.Retention]. Blobs aren't deleted by this package; a
 // separate scrubber deletes blobs no longer referenced by any action after
 // a grace period. Blob deletion must allow for this package's in-process
-// memory of recently seen blobs, which lives as long as a [Cache].
+// memory of recently seen blobs, which lives as long as a [Cache]. Blob
+// servers ([Config.BlobServers]) keep blobs with no time limit, so the
+// scrubber must tell them to evict the blobs that it deletes.
 //
 // See ci/doc/aws-native-gocached.md in Tailscale's corp repo for the design.
 package awscache
@@ -68,6 +70,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/tailscale/tb/gocache/logger"
 	"golang.org/x/sync/semaphore"
+	tslogger "tailscale.com/types/logger"
 	"tailscale.com/util/lru"
 )
 
@@ -215,11 +218,19 @@ type Config struct {
 	// loading the default one.
 	AWSConfig *aws.Config
 
-	// TODO(bradfitz): optional same-AZ read-through NVMe blob cache tier
-	// (stateless pods on EKS, discovered via "m#cache#<az>" DynamoDB items
-	// and sharded by rendezvous hashing of the blob SHA-256), per the "Cache
-	// tier" section of ci/doc/aws-native-gocached.md. It's purely a latency
-	// optimization; everything here works against S3 alone.
+	// BlobServers, if non-empty, is the set of HTTP(S) base URLs (e.g.
+	// http://10.0.0.1:8080) that should be used as a cached pool of blob
+	// servers. Clients will attempt to fetch blobs from one of these servers
+	// before fetching from S3 as a latency optimization. They also ask the
+	// server whether it has a new blob before they upload it to S3, and tell
+	// the server about it after they upload it, so that the server gets it
+	// from S3.
+	//
+	// Clients must all be configured with the same set of URLs, because which
+	// server caches which blob is decided by a rendezvous hash of the blob
+	// SHA256. This allows clients to shard requests between multiple servers
+	// that can pool their aggregate storage.
+	BlobServers []string
 
 	// Test hooks, replacing the AWS clients and clock.
 	meta  metaStore
@@ -230,17 +241,19 @@ type Config struct {
 // Cache is a Go build cache stored in DynamoDB and S3. It's safe for
 // concurrent use. Its only local state is buffers and caches.
 type Cache struct {
-	cfg      Config // with defaults filled in
-	logf     logger.Logf
-	now      func() time.Time
-	m        *metrics
-	meta     metaStore
-	s3blobs  *S3Blobs
-	checks   []func(context.Context) error
-	globalNS storageNS
-	bumper   *atimeBumper
-	memSem   *semaphore.Weighted
-	diskSem  *semaphore.Weighted
+	cfg       Config // with defaults filled in
+	logf      logger.Logf
+	now       func() time.Time
+	m         *metrics
+	meta      metaStore
+	s3blobs   *S3Blobs
+	poolBlobs *blobPoolClient
+	checks    []func(context.Context) error
+	globalNS  storageNS
+	bumper    *atimeBumper
+	poolLogf  logger.Logf
+	memSem    *semaphore.Weighted
+	diskSem   *semaphore.Weighted
 
 	knownMu    sync.Mutex
 	knownBlobs *lru.Cache[string, bool]
@@ -294,6 +307,14 @@ func New(ctx context.Context, cfg Config) (*Cache, error) {
 		diskSem:    semaphore.NewWeighted(max(cfg.SpoolCap, 1)),
 		knownBlobs: &lru.Cache[string, bool]{MaxEntries: cfg.KnownBlobs},
 		bgDone:     make(chan struct{}),
+	}
+	if len(cfg.BlobServers) > 0 {
+		p, err := newBlobPoolClient(cfg.BlobServers)
+		if err != nil {
+			return nil, err
+		}
+		c.poolBlobs = p
+		c.poolLogf = logger.Logf(tslogger.RateLimitedFn(tslogger.Logf(c.logf), time.Minute, 5, 100))
 	}
 	c.bumper = newATimeBumper(c.meta, c.logf, m, c.now, cfg.Relatime, cfg.Retention, cfg.ATimeQueueLen, cfg.ATimeRate)
 
@@ -537,12 +558,12 @@ func (c *Cache) get(ctx context.Context, g Grant, actionID string) (_ *Object, b
 		c.m.corruptBlobs.Inc()
 		return nil, false, nil
 	}
-	sp, err := c.fetchBlob(ctx, key, e)
+	sp, storage, err := c.fetchBlob(ctx, key, e)
 	if err != nil || sp == nil {
 		return nil, false, err
 	}
 	bumped = c.bumper.maybeEnqueue(key, e.AccessTime)
-	return &Object{OutputID: e.OutputID, Size: e.Size, sp: sp, storage: "s3"}, bumped, nil
+	return &Object{OutputID: e.OutputID, Size: e.Size, sp: sp, storage: storage}, bumped, nil
 }
 
 // lookupAction finds actionID in the global namespace or, failing that, g's
@@ -579,19 +600,77 @@ func (c *Cache) lookupAction(ctx context.Context, g Grant, actionID string) (key
 }
 
 // fetchBlob fetches the blob of the non-inline action e (at key) into a
-// spool and verifies it, returning (nil, nil) if it's missing or bad.
-func (c *Cache) fetchBlob(ctx context.Context, key string, e *actionEntry) (*spool, error) {
+// spool and verifies it, returning (nil, "", nil) if it's missing or bad.
+// It returns the storage it fetched from, either "blobserver" or "s3".
+func (c *Cache) fetchBlob(ctx context.Context, key string, e *actionEntry) (_ *spool, storage string, _ error) {
 	// Bound what we'll read, in case the entry is corrupt. lz4 frames of
 	// incompressible data are a little larger than the data.
 	if e.StoredSize < 0 || e.StoredSize > max(e.Size, 0)+e.Size/128+1<<10 {
 		c.logf("awscache: GET %s: corrupt entry: stored size %d for size %d", key, e.StoredSize, e.Size)
 		c.m.corruptBlobs.Inc()
-		return nil, nil
+		return nil, "", nil
 	}
 
-	// TODO(bradfitz): first try the optional same-AZ read-through NVMe
-	// cache pool (see Config), hedging to S3 directly if the pool doesn't
-	// start answering quickly. Until then, every blob GET goes to S3.
+	if c.poolBlobs != nil {
+		sp, err := c.fetchBlobFromPool(ctx, e)
+		if sp != nil {
+			return sp, "blobserver", nil
+		}
+		if ctx.Err() != nil {
+			return nil, "", ctx.Err()
+		}
+		if !errors.Is(err, errBlobServerMiss) {
+			c.poolLogf("awscache: GET %s: %v; falling back to S3", key, err)
+		}
+	}
+
+	sp, err := c.fetchBlobFromS3(ctx, key, e)
+	if err != nil {
+		return nil, "", err
+	}
+	if sp == nil {
+		return nil, "", nil
+	}
+	return sp, "s3", nil
+}
+
+func (c *Cache) fetchBlobFromPool(ctx context.Context, e *actionEntry) (*spool, error) {
+	s, ok := c.poolBlobs.pick(e.SHA256)
+	if !ok {
+		c.m.poolFallbacks.WithLabelValues("down").Inc()
+		return nil, fmt.Errorf("blob server %s is down", s.base)
+	}
+	start := time.Now()
+	rc, err := c.poolBlobs.get(ctx, s, e.SHA256, e.StoredSize)
+	if errors.Is(err, errBlobServerMiss) {
+		c.m.observeOp("blobserver", "GetBlob", "miss", start)
+		c.m.poolFallbacks.WithLabelValues("miss").Inc()
+		return nil, err
+	}
+	c.m.observeOp("blobserver", "GetBlob", cmpResult("ok", err), start)
+	if err != nil {
+		c.m.poolFallbacks.WithLabelValues("error").Inc()
+		return nil, err
+	}
+	defer rc.Close()
+	sp, err := c.newSpool(ctx, e.StoredSize)
+	if err != nil {
+		return nil, err
+	}
+	if n, err := io.Copy(sp, io.LimitReader(rc, e.StoredSize+1)); err != nil || n != e.StoredSize {
+		sp.Close()
+		c.m.poolFallbacks.WithLabelValues("error").Inc()
+		return nil, fmt.Errorf("reading blob %s from %s: %d bytes, %v", e.SHA256, s.base, n, err)
+	}
+	if err := verifyLZ4(sp, e.Size, e.SHA256); err != nil {
+		sp.Close()
+		c.m.poolFallbacks.WithLabelValues("corrupt").Inc()
+		return nil, fmt.Errorf("blob %s from %s: %w", e.SHA256, s.base, err)
+	}
+	return sp, nil
+}
+
+func (c *Cache) fetchBlobFromS3(ctx context.Context, key string, e *actionEntry) (*spool, error) {
 	rc, _, err := c.s3blobs.Get(ctx, e.SHA256)
 	if errors.Is(err, ErrBlobNotFound) {
 		// PUT writes the blob before the action, so this means the
@@ -788,8 +867,11 @@ func (c *Cache) storeBlob(ctx context.Context, key string, e *actionEntry, body 
 		c.m.blobSkips.WithLabelValues("known").Inc()
 		return nil
 	}
-	// TODO(bradfitz): ask the optional NVMe cache pool before S3, which
-	// would usually know about recently written blobs.
+	if c.poolBlobs != nil && c.blobInPool(ctx, e.SHA256, e.StoredSize) {
+		c.m.blobSkips.WithLabelValues("blobserver").Inc()
+		c.noteBlobKnown(e.SHA256)
+		return nil
+	}
 	exists, err := c.s3blobs.exists(ctx, e.SHA256)
 	if err != nil {
 		// Not fatal: an upload is still correct.
@@ -807,9 +889,44 @@ func (c *Cache) storeBlob(ctx context.Context, key string, e *actionEntry, body 
 		}
 		c.m.blobUploads.Inc()
 		c.m.blobUploadBytes.Add(float64(e.StoredSize))
+		if c.poolBlobs != nil {
+			c.warmPool(ctx, e.SHA256)
+		}
 	}
 	c.noteBlobKnown(e.SHA256)
 	return nil
+}
+
+// blobInPool reports whether the blob server that owns the blob sha has it,
+// with the given stored size. Errors are logged, and count as no.
+func (c *Cache) blobInPool(ctx context.Context, sha string, size int64) bool {
+	s, ok := c.poolBlobs.pick(sha)
+	if !ok {
+		return false
+	}
+	start := time.Now()
+	ok, err := c.poolBlobs.has(ctx, s, sha, size)
+	c.m.observeOp("blobserver", "HeadBlob", cmpResult("ok", err), start)
+	if err != nil {
+		c.poolLogf("awscache: HEAD of blob %s on %s: %v", sha, s.base, err)
+	}
+	return ok
+}
+
+// warmPool tells the blob server that owns the blob sha that the blob is in
+// S3, so that the server gets it, and the next GET of the blob is a hit.
+// Errors are logged, not returned.
+func (c *Cache) warmPool(ctx context.Context, sha string) {
+	s, ok := c.poolBlobs.pick(sha)
+	if !ok {
+		return
+	}
+	start := time.Now()
+	err := c.poolBlobs.warm(ctx, s, sha)
+	c.m.observeOp("blobserver", "WarmBlob", cmpResult("ok", err), start)
+	if err != nil {
+		c.poolLogf("awscache: POST of blob %s to %s: %v", sha, s.base, err)
+	}
 }
 
 // blobKnown reports whether this process recently saw the blob sha exist.

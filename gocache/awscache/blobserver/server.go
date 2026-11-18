@@ -12,6 +12,15 @@
 // read access control of the S3 bucket under its prefix for any client that can
 // connect and provide a SHA256.
 //
+// A pool of Servers shares the cached blobs between them. Each client is
+// configured with the same set of Server URLs ([awscache.Config.BlobServers]),
+// and it uses a rendezvous hash of a blob's SHA256 to pick the one server
+// that should hold that blob. The Servers don't know about each other or
+// about the hash. A server caches the blobs that clients ask it for, so the
+// clients' hash defines the content set of each server. If a server is added
+// to or removed from the pool, only the blobs that the hash moves to a
+// different server miss until the pool refills.
+//
 // Clients use three requests, all for /blob/<sha>.lz4:
 //
 //   - GET reads a blob. On a miss, the server sends 404 at once, so that
