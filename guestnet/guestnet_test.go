@@ -618,6 +618,41 @@ func TestDNSTruncation(t *testing.T) {
 	}
 }
 
+func TestNTP(t *testing.T) {
+	now := time.Date(2026, 9, 29, 12, 0, 0, 500_000_000, time.UTC)
+	e := newEnv(t, Config{Dialer: anyDialer{}, Now: func() time.Time { return now }})
+	c, err := e.guest.DialUDP(netip.MustParseAddrPort("17.253.2.1:123"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	req := make([]byte, 48)
+	req[0] = 4<<3 | 3 // v4, client
+	binary.BigEndian.PutUint64(req[40:], 0x1122334455667788)
+	if _, err := c.Write(req); err != nil {
+		t.Fatal(err)
+	}
+	c.SetReadDeadline(time.Now().Add(5 * time.Second))
+	resp := make([]byte, 64)
+	n, err := c.Read(resp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 48 || resp[0]&0x07 != 4 {
+		t.Fatalf("resp len %d mode %d", n, resp[0]&0x07)
+	}
+	if binary.BigEndian.Uint64(resp[24:]) != 0x1122334455667788 {
+		t.Error("originate timestamp not echoed")
+	}
+	ts := binary.BigEndian.Uint64(resp[40:])
+	secs := int64(ts>>32) - ntpEpochOffset
+	frac := float64(ts&0xffffffff) / (1 << 32)
+	got := time.Unix(secs, int64(frac*1e9))
+	if d := got.Sub(now); d < -time.Millisecond || d > time.Millisecond {
+		t.Errorf("transmit = %v, want %v", got, now)
+	}
+}
+
 func TestUDPEgress(t *testing.T) {
 	echo := udpEcho(t)
 	dst := netip.MustParseAddrPort("203.0.113.9:4000")

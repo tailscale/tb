@@ -14,8 +14,9 @@
 //   - DHCP is answered directly from the frame loop with a fixed lease, so a
 //     memory snapshot restored in another slot sees the same addresses.
 //   - Every TCP SYN and UDP flow is dispatched by destination: a registered
-//     [Service] (IMDS, the caller's NFS or proxies), intercepted DNS (on any
-//     port 53), or egress dialed from the host. Each flow is logged.
+//     [Service] (IMDS, the caller's NFS or proxies), an intercepted protocol
+//     (DNS on any port 53, NTP on any port 123), or egress dialed from the
+//     host. Each flow is logged.
 //   - The host reaches the guest only by dialing into this stack with
 //     [Net.DialGuest]; there is no host interface routed to the guest.
 //
@@ -137,7 +138,7 @@ type Config struct {
 	// before egress policy and would let a guest hijack a public address.
 	Services map[netip.AddrPort]Service
 
-	// Now returns the current time, for logs. Defaults to time.Now.
+	// Now returns the current time, for NTP and logs. Defaults to time.Now.
 	Now func() time.Time
 
 	// Logf logs. Defaults to logger.Discard.

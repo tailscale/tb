@@ -43,6 +43,19 @@ func (n *Net) handleUDP(r *udp.ForwarderRequest) bool {
 			conn.Close()
 		}
 		return true
+	case 123:
+		flow.Kind = "ntp"
+		conn := n.acceptUDP(r, flow)
+		if conn == nil {
+			return true
+		}
+		if !n.goTracked(func() {
+			defer n.track(conn)()
+			conn.closeWithErr(n.serveNTP(conn))
+		}) {
+			conn.Close()
+		}
+		return true
 	}
 
 	if !n.egressAllowed(dst.Addr()) {
