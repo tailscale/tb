@@ -5,7 +5,9 @@ package guestnet
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -16,7 +18,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/insomniacslk/dhcp/dhcpv4"
 	"github.com/tailscale/tb/guestnet/guestnettest"
+	"gvisor.dev/gvisor/pkg/tcpip/header"
 )
 
 // anyDialer dials every TCP address to a single local target, standing in
@@ -62,6 +66,129 @@ func testContext(t testing.TB) context.Context {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	t.Cleanup(cancel)
 	return ctx
+}
+
+// dhcpExchange writes a DHCP message from an addressless client and returns
+// the reply.
+func dhcpExchange(t testing.TB, peer *MemLink, mac net.HardwareAddr, msg *dhcpv4.DHCPv4) *dhcpv4.DHCPv4 {
+	t.Helper()
+	frame := buildUDPFrame(mac, net.HardwareAddr{0xff, 0xff, 0xff, 0xff, 0xff, 0xff}, [4]byte{}, [4]byte{255, 255, 255, 255}, dhcpv4.ClientPort, dhcpv4.ServerPort, msg.ToBytes())
+	if err := peer.WriteFrame(frame); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 65536)
+	deadline := time.After(5 * time.Second)
+	for {
+		select {
+		case <-deadline:
+			t.Fatal("timed out waiting for DHCP reply")
+		default:
+		}
+		n, err := peer.ReadFrame(buf)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _, srcPort, dstPort, payload, ok := parseUDPFrame(buf[:n])
+		if !ok || srcPort != dhcpv4.ServerPort || dstPort != dhcpv4.ClientPort {
+			continue
+		}
+		reply, err := dhcpv4.FromBytes(payload)
+		if err != nil {
+			t.Fatalf("bad DHCP reply: %v", err)
+		}
+		return reply
+	}
+}
+
+// parseUDPFrame extracts the addressing and payload of an IPv4 UDP frame.
+func parseUDPFrame(frame []byte) (src, dst [4]byte, srcPort, dstPort uint16, payload []byte, ok bool) {
+	if len(frame) < header.EthernetMinimumSize+header.IPv4MinimumSize+header.UDPMinimumSize {
+		return
+	}
+	eth := header.Ethernet(frame)
+	if eth.Type() != header.IPv4ProtocolNumber {
+		return
+	}
+	ip := header.IPv4(frame[header.EthernetMinimumSize:])
+	if !ip.IsValid(len(ip)) || ip.Protocol() != uint8(header.UDPProtocolNumber) {
+		return
+	}
+	u := header.UDP(ip.Payload())
+	if len(u) < header.UDPMinimumSize {
+		return
+	}
+	return ip.SourceAddress().As4(), ip.DestinationAddress().As4(), u.SourcePort(), u.DestinationPort(), bytes.Clone(u.Payload()), true
+}
+
+func TestDHCP(t *testing.T) {
+	host, peer := NewMemLinkPair()
+	n, err := New(Config{Link: host, Logf: t.Logf, MTU: 9000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer n.Close()
+
+	mac := DefaultGuestMAC
+	disc, err := dhcpv4.NewDiscovery(mac, dhcpv4.WithBroadcast(true))
+	if err != nil {
+		t.Fatal(err)
+	}
+	offer := dhcpExchange(t, peer, mac, disc)
+	if offer.MessageType() != dhcpv4.MessageTypeOffer {
+		t.Fatalf("got %v, want OFFER", offer.MessageType())
+	}
+	if got := offer.YourIPAddr.String(); got != DefaultGuestIP.String() {
+		t.Errorf("yiaddr = %s, want %v", got, DefaultGuestIP)
+	}
+	if got := offer.Router(); len(got) != 1 || got[0].String() != DefaultGatewayIP.String() {
+		t.Errorf("router = %v, want %v", got, DefaultGatewayIP)
+	}
+	if got := offer.DNS(); len(got) != 1 || got[0].String() != DNSAddr.String() {
+		t.Errorf("dns = %v, want %v", got, DNSAddr)
+	}
+	if mtu := offer.Options.Get(dhcpv4.OptionInterfaceMTU); len(mtu) != 2 || binary.BigEndian.Uint16(mtu) != 9000 {
+		t.Errorf("mtu option = %x, want 9000", mtu)
+	}
+	if lt := offer.IPAddressLeaseTime(0); lt != 24*time.Hour {
+		t.Errorf("lease = %v, want 24h", lt)
+	}
+
+	select {
+	case <-n.Leased():
+		t.Fatal("Leased closed after OFFER; should wait for ACK")
+	default:
+	}
+
+	req, err := dhcpv4.NewRequestFromOffer(offer, dhcpv4.WithBroadcast(true))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ack := dhcpExchange(t, peer, mac, req)
+	if ack.MessageType() != dhcpv4.MessageTypeAck {
+		t.Fatalf("got %v, want ACK", ack.MessageType())
+	}
+	select {
+	case <-n.Leased():
+	case <-time.After(time.Second):
+		t.Fatal("Leased not closed after ACK")
+	}
+
+	// A request for a foreign address is refused.
+	bad, err := dhcpv4.NewRequestFromOffer(offer, dhcpv4.WithBroadcast(true), dhcpv4.WithOption(dhcpv4.OptRequestedIPAddress(net.IPv4(10, 1, 2, 3))))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nak := dhcpExchange(t, peer, mac, bad); nak.MessageType() != dhcpv4.MessageTypeNak {
+		t.Errorf("got %v for foreign address, want NAK", nak.MessageType())
+	}
+
+	var kinds []string
+	for _, ev := range n.Events.Recent() {
+		kinds = append(kinds, ev.Kind)
+	}
+	if got := strings.Join(kinds, ","); got != "dhcp-discover,dhcp-lease" {
+		t.Errorf("events = %q", got)
+	}
 }
 
 func TestTCPEgress(t *testing.T) {
