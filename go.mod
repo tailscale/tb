@@ -19,6 +19,7 @@ require (
 	github.com/prometheus/client_model v0.6.3
 	golang.org/x/sync v0.25.0
 	golang.org/x/time v0.16.0
+	gvisor.dev/gvisor v0.0.0-20261117040555-0303b2605d5e
 	modernc.org/sqlite v1.51.0
 	tailscale.com v1.105.0-pre.0.20261120143238-5c7e705edf6a
 )
@@ -47,6 +48,7 @@ require (
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/fxamacker/cbor/v2 v2.9.3 // indirect
 	github.com/go-json-experiment/json v0.0.0-20260820222146-c27c302e5fc3 // indirect
+	github.com/google/btree v1.1.3 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/hdevalence/ed25519consensus v0.2.0 // indirect
 	github.com/jmespath/go-jmespath v0.4.0 // indirect
