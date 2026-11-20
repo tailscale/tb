@@ -1,6 +1,6 @@
 module github.com/tailscale/tb
 
-go 1.27.1
+go 1.27.4
 
 require (
 	github.com/aws/aws-sdk-go-v2 v1.47.3
@@ -11,16 +11,16 @@ require (
 	github.com/bradfitz/parentdeath v0.0.0-20260315043412-764506aeb900
 	github.com/bradfitz/qcow2 v0.0.0-20260303185237-93afc730382b
 	github.com/cespare/xxhash/v2 v2.3.0
-	github.com/go-jose/go-jose/v4 v4.1.3
+	github.com/go-jose/go-jose/v4 v4.1.4
 	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/google/go-cmp v0.7.0
 	github.com/pierrec/lz4/v4 v4.1.26
 	github.com/prometheus/client_golang v1.24.1
 	github.com/prometheus/client_model v0.6.3
-	golang.org/x/sync v0.23.0
+	golang.org/x/sync v0.25.0
 	golang.org/x/time v0.16.0
 	modernc.org/sqlite v1.51.0
-	tailscale.com v1.103.0-pre.0.20260920011920-7d96cf5a62ef
+	tailscale.com v1.105.0-pre.0.20261120143238-5c7e705edf6a
 )
 
 require (
@@ -51,7 +51,7 @@ require (
 	github.com/hdevalence/ed25519consensus v0.2.0 // indirect
 	github.com/jmespath/go-jmespath v0.4.0 // indirect
 	github.com/jsimonetti/rtnetlink v1.4.2 // indirect
-	github.com/klauspost/compress v1.20.0 // indirect
+	github.com/klauspost/compress v1.20.2 // indirect
 	github.com/kylelemons/godebug v1.1.0 // indirect
 	github.com/mattn/go-isatty v0.0.24 // indirect
 	github.com/mdlayher/netlink v1.11.2 // indirect
@@ -66,10 +66,10 @@ require (
 	github.com/x448/float16 v0.8.4 // indirect
 	go4.org/mem v0.0.0-20240501181205-ae6ca9944745 // indirect
 	go4.org/netipx v0.0.0-20260823151212-3075585bcbeb // indirect
-	golang.org/x/crypto v0.57.0 // indirect
+	golang.org/x/crypto v0.59.0 // indirect
 	golang.org/x/exp v0.0.0-20260908205506-85c1c2202aba // indirect
-	golang.org/x/net v0.59.0 // indirect
-	golang.org/x/sys v0.48.0 // indirect
+	golang.org/x/net v0.62.0 // indirect
+	golang.org/x/sys v0.50.0 // indirect
 	golang.zx2c4.com/wireguard/windows v1.0.1 // indirect
 	google.golang.org/protobuf v1.36.12 // indirect
 	modernc.org/libc v1.72.3 // indirect
