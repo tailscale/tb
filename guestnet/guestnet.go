@@ -115,8 +115,14 @@ type Config struct {
 	// snapshots renew against this server, so long leases are fine.
 	LeaseTime time.Duration
 
-	// Dialer dials egress TCP and UDP. Defaults to a net.Dialer.
+	// Dialer dials egress TCP. Defaults to a net.Dialer.
 	Dialer Dialer
+
+	// ListenPacket opens the host sockets for egress UDP, one per guest
+	// source address, so a guest's UDP flows see an endpoint-independent
+	// mapping (an "easy NAT"). It is called with network "udp4" and address
+	// ":0". Defaults to net.ListenConfig.ListenPacket.
+	ListenPacket func(ctx context.Context, network, address string) (net.PacketConn, error)
 
 	// Deny lists destinations the guest may not reach via egress. nil means
 	// [DefaultDeny]; an empty non-nil slice denies nothing.
@@ -159,6 +165,9 @@ func (c *Config) withDefaults() {
 	if c.Dialer == nil {
 		c.Dialer = &net.Dialer{Timeout: 10 * time.Second}
 	}
+	if c.ListenPacket == nil {
+		c.ListenPacket = new(net.ListenConfig).ListenPacket
+	}
 	if c.Deny == nil {
 		c.Deny = DefaultDeny
 	}
@@ -197,6 +206,9 @@ type Net struct {
 
 	mu       sync.Mutex
 	services map[netip.AddrPort]Service
+
+	udpMu   sync.Mutex
+	udpMaps map[netip.AddrPort]*udpMapping // by guest source address
 }
 
 // New starts a guest network on cfg.Link. It returns once the stack is up;
