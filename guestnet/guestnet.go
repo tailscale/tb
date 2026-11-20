@@ -11,6 +11,8 @@
 //
 //   - The gateway, IMDS and DNS addresses live on our NIC, so ARP and ICMP
 //     echo for them are answered by gVisor itself.
+//   - DHCP is answered directly from the frame loop with a fixed lease, so a
+//     memory snapshot restored in another slot sees the same addresses.
 //   - Every TCP SYN is dispatched by destination: a registered [Service]
 //     (IMDS, the caller's NFS or proxies), or egress dialed from the host.
 //     Each flow is logged.
@@ -92,8 +94,10 @@ type Config struct {
 	// Link carries raw Ethernet frames to and from the guest. Required.
 	Link FrameLink
 
-	// GuestMAC is the guest's expected MAC address. Defaults to
-	// [DefaultGuestMAC].
+	// GuestMAC is the guest's expected MAC address. It is informational for
+	// now: DHCP answers any client and replies to the requesting client's
+	// hardware address, so a guest restored from a snapshot with some other
+	// MAC still gets its lease. Defaults to [DefaultGuestMAC].
 	GuestMAC net.HardwareAddr
 	// GatewayMAC is our MAC. Defaults to [DefaultGatewayMAC].
 	GatewayMAC net.HardwareAddr
@@ -103,8 +107,12 @@ type Config struct {
 	GatewayIP netip.Addr
 	GuestIP   netip.Addr
 
-	// MTU is the link MTU. Defaults to 1500.
+	// MTU is the link MTU advertised to the guest via DHCP. Defaults to 1500.
 	MTU uint32
+
+	// LeaseTime is the DHCP lease duration. Defaults to 24h. Restored
+	// snapshots renew against this server, so long leases are fine.
+	LeaseTime time.Duration
 
 	// Dialer dials egress TCP. Defaults to a net.Dialer.
 	Dialer Dialer
@@ -144,6 +152,9 @@ func (c *Config) withDefaults() {
 	if c.MTU == 0 {
 		c.MTU = 1500
 	}
+	if c.LeaseTime == 0 {
+		c.LeaseTime = 24 * time.Hour
+	}
 	if c.Dialer == nil {
 		c.Dialer = &net.Dialer{Timeout: 10 * time.Second}
 	}
@@ -176,8 +187,12 @@ type Net struct {
 
 	// Flows is the TCP/UDP flow log.
 	Flows *Log[Flow]
-	// Events records notable network events (blocked flows, dial errors).
+	// Events records notable network events (DHCP lease, blocked flows).
 	Events *Log[Event]
+
+	// dhcpLeased is closed the first time the guest acknowledges a lease.
+	dhcpLeased     chan struct{}
+	dhcpLeasedOnce sync.Once
 
 	mu       sync.Mutex
 	services map[netip.AddrPort]Service
@@ -199,12 +214,13 @@ func New(cfg Config) (*Net, error) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	n := &Net{
-		cfg:      cfg,
-		ctx:      ctx,
-		cancel:   cancel,
-		Flows:    NewLog[Flow](1024),
-		Events:   NewLog[Event](256),
-		services: make(map[netip.AddrPort]Service),
+		cfg:        cfg,
+		ctx:        ctx,
+		cancel:     cancel,
+		Flows:      NewLog[Flow](1024),
+		Events:     NewLog[Event](256),
+		dhcpLeased: make(chan struct{}),
+		services:   make(map[netip.AddrPort]Service),
 	}
 	for ap, svc := range cfg.Services {
 		n.services[ap] = svc
@@ -313,6 +329,12 @@ func (n *Net) GuestIP() netip.Addr { return n.cfg.GuestIP }
 // GatewayIP returns our address on the guest subnet.
 func (n *Net) GatewayIP() netip.Addr { return n.cfg.GatewayIP }
 
+// Leased returns a channel that is closed once the guest has acknowledged a
+// DHCP lease. For a restored snapshot this may not fire until the guest
+// renews, so callers should also consider the guest reachable if
+// [Net.DialGuest] succeeds.
+func (n *Net) Leased() <-chan struct{} { return n.dhcpLeased }
+
 // SetService registers or replaces the handler for a guest-visible
 // destination. Passing a nil svc removes it.
 func (n *Net) SetService(dst netip.AddrPort, svc Service) {
@@ -340,7 +362,8 @@ func (n *Net) DialGuest(ctx context.Context, port uint16) (net.Conn, error) {
 	return gonet.DialTCPWithBind(ctx, n.stack, local, remote, ipv4.ProtocolNumber)
 }
 
-// pumpFromGuest reads frames from the link and injects them into gVisor.
+// pumpFromGuest reads frames from the link, answers DHCP directly, and injects
+// everything else into gVisor.
 func (n *Net) pumpFromGuest() {
 	buf := make([]byte, 65536+header.EthernetMinimumSize)
 	for {
@@ -359,6 +382,9 @@ func (n *Net) pumpFromGuest() {
 		eth := header.Ethernet(frame)
 		switch eth.Type() {
 		case header.IPv4ProtocolNumber:
+			if n.handleDHCP(frame) {
+				continue
+			}
 		case header.ARPProtocolNumber:
 			if !n.arpForUs(frame[header.EthernetMinimumSize:]) {
 				continue
@@ -409,6 +435,13 @@ func (n *Net) pumpToGuest() {
 		if err != nil && n.ctx.Err() == nil {
 			n.cfg.Logf("guestnet: link write: %v", err)
 		}
+	}
+}
+
+// writeFrame sends a frame we built ourselves (DHCP replies) to the guest.
+func (n *Net) writeFrame(frame []byte) {
+	if err := n.cfg.Link.WriteFrame(frame); err != nil && n.ctx.Err() == nil {
+		n.cfg.Logf("guestnet: link write: %v", err)
 	}
 }
 
