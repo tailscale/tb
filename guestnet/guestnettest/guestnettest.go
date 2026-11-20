@@ -119,6 +119,12 @@ func (g *Guest) DialTCP(ctx context.Context, dst netip.AddrPort) (net.Conn, erro
 	return gonet.DialContextTCP(ctx, g.s, fullAddr(dst), ipv4.ProtocolNumber)
 }
 
+// DialUDP opens a UDP socket from the guest connected to dst.
+func (g *Guest) DialUDP(dst netip.AddrPort) (net.Conn, error) {
+	fa := fullAddr(dst)
+	return gonet.DialUDP(g.s, nil, &fa, ipv4.ProtocolNumber)
+}
+
 // ListenTCP listens on port on the guest.
 func (g *Guest) ListenTCP(port uint16) (net.Listener, error) {
 	return gonet.ListenTCP(g.s, tcpip.FullAddress{NIC: 1, Port: port}, ipv4.ProtocolNumber)

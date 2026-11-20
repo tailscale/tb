@@ -13,9 +13,9 @@
 //     echo for them are answered by gVisor itself.
 //   - DHCP is answered directly from the frame loop with a fixed lease, so a
 //     memory snapshot restored in another slot sees the same addresses.
-//   - Every TCP SYN is dispatched by destination: a registered [Service]
-//     (IMDS, the caller's NFS or proxies), or egress dialed from the host.
-//     Each flow is logged.
+//   - Every TCP SYN and UDP flow is dispatched by destination: a registered
+//     [Service] (IMDS, the caller's NFS or proxies), or egress dialed from
+//     the host. Each flow is logged.
 //   - The host reaches the guest only by dialing into this stack with
 //     [Net.DialGuest]; there is no host interface routed to the guest.
 //
@@ -43,6 +43,7 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/icmp"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
+	"gvisor.dev/gvisor/pkg/tcpip/transport/udp"
 	"tailscale.com/types/logger"
 )
 
@@ -114,7 +115,7 @@ type Config struct {
 	// snapshots renew against this server, so long leases are fine.
 	LeaseTime time.Duration
 
-	// Dialer dials egress TCP. Defaults to a net.Dialer.
+	// Dialer dials egress TCP and UDP. Defaults to a net.Dialer.
 	Dialer Dialer
 
 	// Deny lists destinations the guest may not reach via egress. nil means
@@ -228,7 +229,7 @@ func New(cfg Config) (*Net, error) {
 
 	s := stack.New(stack.Options{
 		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol, arp.NewProtocol},
-		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol, icmp.NewProtocol4},
+		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol, udp.NewProtocol, icmp.NewProtocol4},
 	})
 	sack := tcpip.TCPSACKEnabled(true)
 	if err := s.SetTransportProtocolOption(tcp.ProtocolNumber, &sack); err != nil {
@@ -285,6 +286,8 @@ func New(cfg Config) (*Net, error) {
 
 	tcpFwd := tcp.NewForwarder(s, 0, 4096, n.handleTCP)
 	s.SetTransportProtocolHandler(tcp.ProtocolNumber, tcpFwd.HandlePacket)
+	udpFwd := udp.NewForwarder(s, n.handleUDP)
+	s.SetTransportProtocolHandler(udp.ProtocolNumber, udpFwd.HandlePacket)
 
 	n.stack = s
 	n.wg.Go(n.pumpFromGuest)
