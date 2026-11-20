@@ -23,16 +23,20 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 )
 
-// anyDialer dials every TCP address to a single local target, standing in
-// for the internet in tests.
+// anyDialer dials every address to a single local target, standing in for
+// the internet in tests.
 type anyDialer struct {
 	tcpTarget string
+	udpTarget string
 }
 
 func (d anyDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
 	var nd net.Dialer
-	if strings.HasPrefix(network, "tcp") {
+	switch {
+	case strings.HasPrefix(network, "tcp"):
 		return nd.DialContext(ctx, network, d.tcpTarget)
+	case strings.HasPrefix(network, "udp"):
+		return nd.DialContext(ctx, network, d.udpTarget)
 	}
 	return nil, fmt.Errorf("unsupported network %q", network)
 }
@@ -391,6 +395,49 @@ func TestService(t *testing.T) {
 	}
 	if !dialErr {
 		t.Errorf("no dial-error event; events: %+v", e.n.Events.Recent())
+	}
+}
+
+func TestUDPEgress(t *testing.T) {
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pc.Close()
+	go func() {
+		buf := make([]byte, 1500)
+		for {
+			n, addr, err := pc.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			pc.WriteTo(append([]byte("echo:"), buf[:n]...), addr)
+		}
+	}()
+	e := newEnv(t, Config{Dialer: anyDialer{udpTarget: pc.LocalAddr().String()}})
+	dst := netip.MustParseAddrPort("203.0.113.9:4000")
+	c, err := e.guest.DialUDP(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	if _, err := c.Write([]byte("hi")); err != nil {
+		t.Fatal(err)
+	}
+	c.SetReadDeadline(time.Now().Add(5 * time.Second))
+	buf := make([]byte, 100)
+	n, err := c.Read(buf)
+	if err != nil || string(buf[:n]) != "echo:hi" {
+		t.Fatalf("got %q, %v", buf[:n], err)
+	}
+	var open bool
+	for _, f := range e.n.Flows.Recent() {
+		if f.Dst == dst && f.Kind == "egress" {
+			open = true
+		}
+	}
+	if !open {
+		t.Errorf("no egress flow record for %v", dst)
 	}
 }
 
