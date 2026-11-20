@@ -14,8 +14,8 @@
 //   - DHCP is answered directly from the frame loop with a fixed lease, so a
 //     memory snapshot restored in another slot sees the same addresses.
 //   - Every TCP SYN and UDP flow is dispatched by destination: a registered
-//     [Service] (IMDS, the caller's NFS or proxies), or egress dialed from
-//     the host. Each flow is logged.
+//     [Service] (IMDS, the caller's NFS or proxies), intercepted DNS (on any
+//     port 53), or egress dialed from the host. Each flow is logged.
 //   - The host reaches the guest only by dialing into this stack with
 //     [Net.DialGuest]; there is no host interface routed to the guest.
 //
@@ -124,6 +124,10 @@ type Config struct {
 	// ":0". Defaults to net.ListenConfig.ListenPacket.
 	ListenPacket func(ctx context.Context, network, address string) (net.PacketConn, error)
 
+	// Resolver answers the guest's DNS queries. Defaults to
+	// [NewUpstreamResolver] with [DefaultUpstreams].
+	Resolver Resolver
+
 	// Deny lists destinations the guest may not reach via egress. nil means
 	// [DefaultDeny]; an empty non-nil slice denies nothing.
 	Deny []netip.Prefix
@@ -168,6 +172,9 @@ func (c *Config) withDefaults() {
 	if c.ListenPacket == nil {
 		c.ListenPacket = new(net.ListenConfig).ListenPacket
 	}
+	if c.Resolver == nil {
+		c.Resolver = NewUpstreamResolver(DefaultUpstreams...)
+	}
 	if c.Deny == nil {
 		c.Deny = DefaultDeny
 	}
@@ -197,6 +204,8 @@ type Net struct {
 
 	// Flows is the TCP/UDP flow log.
 	Flows *Log[Flow]
+	// DNS is the DNS query log.
+	DNS *Log[DNSEvent]
 	// Events records notable network events (DHCP lease, blocked flows).
 	Events *Log[Event]
 
@@ -231,6 +240,7 @@ func New(cfg Config) (*Net, error) {
 		ctx:        ctx,
 		cancel:     cancel,
 		Flows:      NewLog[Flow](1024),
+		DNS:        NewLog[DNSEvent](1024),
 		Events:     NewLog[Event](256),
 		dhcpLeased: make(chan struct{}),
 		services:   make(map[netip.AddrPort]Service),

@@ -29,6 +29,22 @@ func (n *Net) handleUDP(r *udp.ForwarderRequest) bool {
 	src := netip.AddrPortFrom(addrFromTCPIP(id.RemoteAddress), id.RemotePort)
 	flow := Flow{ID: flowIDs.Add(1), Proto: "udp", Src: src, Dst: dst, Start: n.cfg.Now()}
 
+	switch dst.Port() {
+	case 53:
+		flow.Kind = "dns"
+		conn := n.acceptUDP(r, flow)
+		if conn == nil {
+			return true
+		}
+		if !n.goTracked(func() {
+			defer n.track(conn)()
+			conn.closeWithErr(n.serveDNSUDP(conn, src, dst))
+		}) {
+			conn.Close()
+		}
+		return true
+	}
+
 	if !n.egressAllowed(dst.Addr()) {
 		// Multicast (mDNS, SSDP) and broadcast chatter is dropped silently;
 		// unicast blocks are worth a record.

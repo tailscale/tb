@@ -48,6 +48,21 @@ func (n *Net) handleTCP(r *tcp.ForwarderRequest) {
 		return
 	}
 
+	if dst.Port() == 53 {
+		flow.Kind = "dns"
+		conn := n.acceptTCP(r, flow)
+		if conn == nil {
+			return
+		}
+		if !n.goTracked(func() {
+			defer n.track(conn)()
+			conn.closeWithErr(n.serveDNSTCP(conn, src, dst))
+		}) {
+			conn.Close()
+		}
+		return
+	}
+
 	if !n.egressAllowed(dst.Addr()) {
 		flow.Kind = "blocked"
 		flow.End = flow.Start

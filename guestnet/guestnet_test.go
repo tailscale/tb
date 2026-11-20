@@ -21,6 +21,7 @@ import (
 
 	"github.com/insomniacslk/dhcp/dhcpv4"
 	"github.com/tailscale/tb/guestnet/guestnettest"
+	"golang.org/x/net/dns/dnsmessage"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 )
 
@@ -463,6 +464,157 @@ func TestService(t *testing.T) {
 	}
 	if !dialErr {
 		t.Errorf("no dial-error event; events: %+v", e.n.Events.Recent())
+	}
+}
+
+func TestDNS(t *testing.T) {
+	e := newEnv(t, Config{Dialer: anyDialer{}, Resolver: StaticResolver{Addr: netip.MustParseAddr("10.9.8.7")}})
+
+	// Guest queries a public resolver; we intercept regardless of address.
+	dst := netip.MustParseAddrPort("8.8.8.8:53")
+	c, err := e.guest.DialUDP(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	q := dnsmessage.Message{
+		Header:    dnsmessage.Header{ID: 0xBEEF, RecursionDesired: true},
+		Questions: []dnsmessage.Question{{Name: dnsmessage.MustNewName("example.com."), Type: dnsmessage.TypeA, Class: dnsmessage.ClassINET}},
+	}
+	qb, err := q.Pack()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Write(qb); err != nil {
+		t.Fatal(err)
+	}
+	c.SetReadDeadline(time.Now().Add(5 * time.Second))
+	buf := make([]byte, 4096)
+	n, err := c.Read(buf)
+	if err != nil {
+		t.Fatalf("read DNS response: %v", err)
+	}
+	var m dnsmessage.Message
+	if err := m.Unpack(buf[:n]); err != nil {
+		t.Fatal(err)
+	}
+	if m.ID != 0xBEEF || len(m.Answers) != 1 {
+		t.Fatalf("response = %+v", m)
+	}
+	if a, ok := m.Answers[0].Body.(*dnsmessage.AResource); !ok || a.A != [4]byte{10, 9, 8, 7} {
+		t.Fatalf("answer = %+v", m.Answers[0].Body)
+	}
+
+	// Also over TCP, to the advertised resolver address.
+	tc, err := e.guest.DialTCP(testContext(t), netip.AddrPortFrom(DNSAddr, 53))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tc.Close()
+	if err := writeDNSTCP(tc, qb); err != nil {
+		t.Fatal(err)
+	}
+	tc.SetReadDeadline(time.Now().Add(5 * time.Second))
+	resp, err := readDNSTCP(tc)
+	if err != nil {
+		t.Fatalf("TCP DNS: %v", err)
+	}
+	if err := m.Unpack(resp); err != nil || len(m.Answers) != 1 {
+		t.Fatalf("TCP response = %+v, %v", m, err)
+	}
+
+	events := e.n.DNS.Recent()
+	if len(events) != 2 {
+		t.Fatalf("got %d DNS events, want 2: %+v", len(events), events)
+	}
+	for _, ev := range events {
+		if ev.Name != "example.com." || ev.Type != "TypeA" || ev.Answers != 1 || ev.Upstream != "static" {
+			t.Errorf("event = %+v", ev)
+		}
+	}
+	if events[0].Proto != "udp" || events[1].Proto != "tcp" {
+		t.Errorf("protos = %s, %s", events[0].Proto, events[1].Proto)
+	}
+}
+
+// bigResolver answers every query with enough A records to overflow a plain
+// (non-EDNS0) UDP response.
+type bigResolver struct{}
+
+func (bigResolver) Exchange(ctx context.Context, query []byte) ([]byte, string, error) {
+	var q dnsmessage.Message
+	if err := q.Unpack(query); err != nil {
+		return nil, "", err
+	}
+	resp := dnsmessage.Message{
+		Header:    dnsmessage.Header{ID: q.ID, Response: true},
+		Questions: q.Questions,
+	}
+	for i := range 64 {
+		resp.Answers = append(resp.Answers, dnsmessage.Resource{
+			Header: dnsmessage.ResourceHeader{Name: q.Questions[0].Name, Type: dnsmessage.TypeA, Class: dnsmessage.ClassINET, TTL: 60},
+			Body:   &dnsmessage.AResource{A: [4]byte{10, 0, 0, byte(i)}},
+		})
+	}
+	b, err := resp.Pack()
+	return b, "big", err
+}
+
+func TestDNSTruncation(t *testing.T) {
+	e := newEnv(t, Config{Dialer: anyDialer{}, Resolver: bigResolver{}})
+	q := dnsmessage.Message{
+		Header:    dnsmessage.Header{ID: 0x1234, RecursionDesired: true},
+		Questions: []dnsmessage.Question{{Name: dnsmessage.MustNewName("example.com."), Type: dnsmessage.TypeA, Class: dnsmessage.ClassINET}},
+	}
+	qb, err := q.Pack()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Over UDP without EDNS0, the answer doesn't fit in 512 bytes, so the
+	// guest gets a truncated response.
+	c, err := e.guest.DialUDP(netip.AddrPortFrom(DNSAddr, 53))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	if _, err := c.Write(qb); err != nil {
+		t.Fatal(err)
+	}
+	c.SetReadDeadline(time.Now().Add(5 * time.Second))
+	buf := make([]byte, 4096)
+	n, err := c.Read(buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n > 512 {
+		t.Errorf("UDP response is %d bytes; want at most 512", n)
+	}
+	var m dnsmessage.Message
+	if err := m.Unpack(buf[:n]); err != nil {
+		t.Fatal(err)
+	}
+	if m.ID != 0x1234 || !m.Truncated || len(m.Answers) != 0 || len(m.Questions) != 1 {
+		t.Errorf("UDP response = %+v; want truncated with the question and no answers", m.Header)
+	}
+
+	// Over TCP, the guest gets all of it.
+	tc, err := e.guest.DialTCP(testContext(t), netip.AddrPortFrom(DNSAddr, 53))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tc.Close()
+	if err := writeDNSTCP(tc, qb); err != nil {
+		t.Fatal(err)
+	}
+	tc.SetReadDeadline(time.Now().Add(5 * time.Second))
+	resp, err := readDNSTCP(tc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Unpack(resp); err != nil || m.Truncated || len(m.Answers) != 64 {
+		t.Errorf("TCP response: truncated=%v, %d answers, err %v; want all 64", m.Truncated, len(m.Answers), err)
 	}
 }
 
