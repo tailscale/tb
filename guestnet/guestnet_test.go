@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"net/netip"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -23,22 +24,89 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 )
 
-// anyDialer dials every address to a single local target, standing in for
-// the internet in tests.
+// anyDialer dials every TCP address to a single local target, standing in
+// for the internet in tests.
 type anyDialer struct {
 	tcpTarget string
-	udpTarget string
 }
 
 func (d anyDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
 	var nd net.Dialer
-	switch {
-	case strings.HasPrefix(network, "tcp"):
+	if strings.HasPrefix(network, "tcp") {
 		return nd.DialContext(ctx, network, d.tcpTarget)
-	case strings.HasPrefix(network, "udp"):
-		return nd.DialContext(ctx, network, d.udpTarget)
 	}
 	return nil, fmt.Errorf("unsupported network %q", network)
+}
+
+// remapPacketConn stands in for the internet for egress UDP: datagrams to a
+// fake address in to go to the real (loopback) address it maps to, and
+// replies from that address appear to come from the fake one.
+type remapPacketConn struct {
+	net.PacketConn
+	to map[netip.AddrPort]netip.AddrPort // fake -> real
+}
+
+func (c *remapPacketConn) WriteTo(b []byte, addr net.Addr) (int, error) {
+	if real, ok := c.to[addr.(*net.UDPAddr).AddrPort()]; ok {
+		addr = net.UDPAddrFromAddrPort(real)
+	}
+	return c.PacketConn.WriteTo(b, addr)
+}
+
+func (c *remapPacketConn) ReadFrom(b []byte) (int, net.Addr, error) {
+	n, addr, err := c.PacketConn.ReadFrom(b)
+	if err == nil {
+		from := addr.(*net.UDPAddr).AddrPort()
+		for fake, real := range c.to {
+			if real == from {
+				addr = net.UDPAddrFromAddrPort(fake)
+			}
+		}
+	}
+	return n, addr, err
+}
+
+// remapListenPacket returns a Config.ListenPacket whose sockets remap
+// addresses per to, and a func reporting the host addresses it has opened.
+func remapListenPacket(to map[netip.AddrPort]netip.AddrPort) (func(ctx context.Context, network, address string) (net.PacketConn, error), func() []net.Addr) {
+	var mu sync.Mutex
+	var opened []net.Addr
+	listen := func(ctx context.Context, network, address string) (net.PacketConn, error) {
+		pc, err := net.ListenPacket("udp4", "127.0.0.1:0")
+		if err != nil {
+			return nil, err
+		}
+		mu.Lock()
+		opened = append(opened, pc.LocalAddr())
+		mu.Unlock()
+		return &remapPacketConn{PacketConn: pc, to: to}, nil
+	}
+	return listen, func() []net.Addr {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]net.Addr(nil), opened...)
+	}
+}
+
+// udpEcho runs a UDP server on loopback that replies to each datagram with
+// the datagram and the sender's address, until the test ends.
+func udpEcho(t *testing.T) net.PacketConn {
+	pc, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { pc.Close() })
+	go func() {
+		buf := make([]byte, 1500)
+		for {
+			n, addr, err := pc.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			pc.WriteTo(fmt.Appendf(nil, "echo:%s from %v", buf[:n], addr), addr)
+		}
+	}()
+	return pc
 }
 
 type env struct {
@@ -399,23 +467,12 @@ func TestService(t *testing.T) {
 }
 
 func TestUDPEgress(t *testing.T) {
-	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer pc.Close()
-	go func() {
-		buf := make([]byte, 1500)
-		for {
-			n, addr, err := pc.ReadFrom(buf)
-			if err != nil {
-				return
-			}
-			pc.WriteTo(append([]byte("echo:"), buf[:n]...), addr)
-		}
-	}()
-	e := newEnv(t, Config{Dialer: anyDialer{udpTarget: pc.LocalAddr().String()}})
+	echo := udpEcho(t)
 	dst := netip.MustParseAddrPort("203.0.113.9:4000")
+	listen, _ := remapListenPacket(map[netip.AddrPort]netip.AddrPort{
+		dst: echo.LocalAddr().(*net.UDPAddr).AddrPort(),
+	})
+	e := newEnv(t, Config{Dialer: anyDialer{}, ListenPacket: listen})
 	c, err := e.guest.DialUDP(dst)
 	if err != nil {
 		t.Fatal(err)
@@ -427,7 +484,7 @@ func TestUDPEgress(t *testing.T) {
 	c.SetReadDeadline(time.Now().Add(5 * time.Second))
 	buf := make([]byte, 100)
 	n, err := c.Read(buf)
-	if err != nil || string(buf[:n]) != "echo:hi" {
+	if err != nil || !strings.HasPrefix(string(buf[:n]), "echo:hi from ") {
 		t.Fatalf("got %q, %v", buf[:n], err)
 	}
 	var open bool
@@ -438,6 +495,88 @@ func TestUDPEgress(t *testing.T) {
 	}
 	if !open {
 		t.Errorf("no egress flow record for %v", dst)
+	}
+}
+
+// TestUDPEasyNAT checks that a guest UDP source address keeps one host
+// address and port across destinations (endpoint-independent mapping), and
+// that inbound datagrams only get through from remotes the guest has sent
+// to.
+func TestUDPEasyNAT(t *testing.T) {
+	echoA, echoB := udpEcho(t), udpEcho(t)
+	stranger, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stranger.Close()
+	dstA := netip.MustParseAddrPort("203.0.113.9:4000")
+	dstB := netip.MustParseAddrPort("198.51.100.7:5000")
+	dstStranger := netip.MustParseAddrPort("192.0.2.1:6000")
+	listen, opened := remapListenPacket(map[netip.AddrPort]netip.AddrPort{
+		dstA:        echoA.LocalAddr().(*net.UDPAddr).AddrPort(),
+		dstB:        echoB.LocalAddr().(*net.UDPAddr).AddrPort(),
+		dstStranger: stranger.LocalAddr().(*net.UDPAddr).AddrPort(),
+	})
+	e := newEnv(t, Config{Dialer: anyDialer{}, ListenPacket: listen})
+
+	c, err := e.guest.ListenUDP(40000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	// readFrom reads one datagram to the guest, or returns "" on timeout.
+	readFrom := func(d time.Duration) (string, net.Addr) {
+		c.SetReadDeadline(time.Now().Add(d))
+		buf := make([]byte, 200)
+		n, from, err := c.ReadFrom(buf)
+		if err != nil {
+			return "", nil
+		}
+		return string(buf[:n]), from
+	}
+
+	sawFrom := map[string]string{} // destination -> host address it saw
+	for _, dst := range []netip.AddrPort{dstA, dstB} {
+		if _, err := c.WriteTo([]byte("hi"), net.UDPAddrFromAddrPort(dst)); err != nil {
+			t.Fatal(err)
+		}
+		got, from := readFrom(5 * time.Second)
+		host, ok := strings.CutPrefix(got, "echo:hi from ")
+		if !ok {
+			t.Fatalf("reply via %v = %q", dst, got)
+		}
+		if from.String() != dst.String() {
+			t.Errorf("reply via %v came from %v", dst, from)
+		}
+		sawFrom[dst.String()] = host
+	}
+	if a, b := sawFrom[dstA.String()], sawFrom[dstB.String()]; a != b {
+		t.Errorf("destinations saw different host addresses %v and %v; want one mapping", a, b)
+	}
+	if got := opened(); len(got) != 1 {
+		t.Errorf("opened %d host sockets %v; want 1", len(got), got)
+	}
+
+	// A remote the guest never sent to is filtered, even at the mapping's
+	// address.
+	mapped, err := net.ResolveUDPAddr("udp4", sawFrom[dstA.String()])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := stranger.WriteTo([]byte("unsolicited"), mapped); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := readFrom(300 * time.Millisecond); got != "" {
+		t.Errorf("guest received %q from a remote it never sent to", got)
+	}
+
+	// A remote the guest did send to can send more, unprompted.
+	if _, err := echoB.WriteTo([]byte("later"), mapped); err != nil {
+		t.Fatal(err)
+	}
+	if got, from := readFrom(5 * time.Second); got != "later" || from.String() != dstB.String() {
+		t.Errorf("got %q from %v; want %q from %v", got, from, "later", dstB)
 	}
 }
 

@@ -125,6 +125,13 @@ func (g *Guest) DialUDP(dst netip.AddrPort) (net.Conn, error) {
 	return gonet.DialUDP(g.s, nil, &fa, ipv4.ProtocolNumber)
 }
 
+// ListenUDP opens an unconnected UDP socket on the guest at port, for
+// sending to several destinations from one source address.
+func (g *Guest) ListenUDP(port uint16) (*gonet.UDPConn, error) {
+	fa := tcpip.FullAddress{NIC: 1, Port: port}
+	return gonet.DialUDP(g.s, &fa, nil, ipv4.ProtocolNumber)
+}
+
 // ListenTCP listens on port on the guest.
 func (g *Guest) ListenTCP(port uint16) (net.Listener, error) {
 	return gonet.ListenTCP(g.s, tcpip.FullAddress{NIC: 1, Port: port}, ipv4.ProtocolNumber)

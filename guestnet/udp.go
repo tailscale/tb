@@ -5,7 +5,6 @@ package guestnet
 
 import (
 	"fmt"
-	"net"
 	"net/netip"
 	"time"
 
@@ -49,7 +48,7 @@ func (n *Net) handleUDP(r *udp.ForwarderRequest) bool {
 	}
 	if !n.goTracked(func() {
 		defer n.track(conn)()
-		conn.closeWithErr(n.relayUDP(conn, dst))
+		conn.closeWithErr(n.relayUDP(conn, src, dst))
 	}) {
 		conn.Close()
 	}
@@ -70,48 +69,4 @@ func (n *Net) acceptUDP(r *udp.ForwarderRequest, flow Flow) *flowConn {
 	}
 	n.Flows.Add(flow)
 	return newFlowConn(n, gonet.NewUDPConn(&wq, ep), flow)
-}
-
-// relayUDP shuttles datagrams between the guest session and a host-side UDP
-// socket to dst until idle. Byte counts are kept by the flowConn.
-func (n *Net) relayUDP(guest net.Conn, dst netip.AddrPort) error {
-	remote, err := n.cfg.Dialer.DialContext(n.ctx, "udp", dst.String())
-	if err != nil {
-		n.Events.Add(Event{Time: n.cfg.Now(), Kind: "dial-error", Msg: fmt.Sprintf("udp %v: %v", dst, err)})
-		return err
-	}
-	defer remote.Close()
-	defer n.track(remote)()
-
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		buf := make([]byte, udpMaxPacket)
-		for {
-			remote.SetReadDeadline(time.Now().Add(udpIdleTimeout))
-			m, err := remote.Read(buf)
-			if err != nil {
-				guest.Close()
-				return
-			}
-			if _, err := guest.Write(buf[:m]); err != nil {
-				return
-			}
-		}
-	}()
-	buf := make([]byte, udpMaxPacket)
-	for {
-		guest.SetReadDeadline(time.Now().Add(udpIdleTimeout))
-		m, err := guest.Read(buf)
-		if err != nil {
-			// Idle timeout, guest close, or Net shutdown: all normal.
-			remote.Close()
-			<-done
-			return nil
-		}
-		if _, err := remote.Write(buf[:m]); err != nil {
-			<-done
-			return err
-		}
-	}
 }
