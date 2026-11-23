@@ -508,21 +508,74 @@ func TestServerPOST(t *testing.T) {
 		close(s3.gate)
 		synctest.Wait()
 
-		// A POST doesn't start a fill if maxFills fills are in progress.
+	})
+}
+
+func TestServerFillQueue(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const maxQueued = 3
+		s3 := newFakeS3()
+		s := newTestServer(t, s3, 1<<20, withMaxQueued(maxQueued))
+		warms := func(r string) float64 { return testutil.ToFloat64(s.m.warms.WithLabelValues(r)) }
 		var blobs []blob
-		for range maxFills + 1 {
+		for range maxFills + maxQueued + 1 {
 			b := newBlob(t, randBytes(10))
 			blobs = append(blobs, b)
 			s3.blobs[b.sha] = b.lz4
 		}
 		s3.gate, s3.gateSHA = make(chan struct{}), ""
-		for _, b := range blobs {
-			post(b.sha)
+
+		// If maxFills fills are in progress, a POST or a GET miss puts the
+		// blob in the queue of fills. If the queue is full, the server
+		// drops the fill.
+		for _, b := range blobs[:maxFills+1] {
+			if code, _, _ := serveBlob(s, "POST", b.sha); code != http.StatusAccepted {
+				t.Fatalf("POST = %d; want 202", code)
+			}
 		}
-		if got := testutil.ToFloat64(s.m.fillsInProgress); got != maxFills || warms("busy") != 1 {
-			t.Errorf("fills in progress, busy = %v, %v; want %d, 1", got, warms("busy"), maxFills)
+		for _, b := range blobs[maxFills+1:] {
+			fillBlob(t, s, b.sha)
 		}
+		// A blob that is in the queue isn't put in it again.
+		queuedSHA := blobs[maxFills].sha
+		fillBlob(t, s, queuedSHA)
+		serveBlob(s, "POST", queuedSHA)
+		if got := testutil.ToFloat64(s.m.fillsInProgress); got != maxFills {
+			t.Errorf("fills in progress = %v; want %d", got, maxFills)
+		}
+		if got := testutil.ToFloat64(s.m.fillsQueued); got != maxQueued {
+			t.Errorf("fills queued = %v; want %d", got, maxQueued)
+		}
+		if warms("queued") != 2 {
+			t.Errorf("queued POSTs = %v; want 2", warms("queued"))
+		}
+
+		// When the fills in progress end, the server fills the blobs in
+		// the queue.
 		close(s3.gate)
+		synctest.Wait()
+		if got := testutil.ToFloat64(s.m.fillsInProgress); got != 0 {
+			t.Errorf("fills in progress after the fills = %v; want 0", got)
+		}
+		if got := testutil.ToFloat64(s.m.fillsQueued); got != 0 {
+			t.Errorf("fills queued after the fills = %v; want 0", got)
+		}
+		if got := fills(s, "stored"); got != maxFills+maxQueued {
+			t.Errorf("stored fills = %v; want %d", got, maxFills+maxQueued)
+		}
+		if gets := s3.getCount(); gets != maxFills+maxQueued {
+			t.Errorf("S3 gets = %d; want %d", gets, maxFills+maxQueued)
+		}
+		for i, b := range blobs[:len(blobs)-1] {
+			if code, body := getBlob(s, b.sha); code != 200 || !bytes.Equal(body, b.lz4) {
+				t.Errorf("GET of blob %d = %d, %d bytes; want 200, %d bytes", i, code, len(body), b.size())
+			}
+		}
+		// The queue was full, so the server dropped the fill of the last
+		// blob.
+		if code, _ := getBlob(s, blobs[len(blobs)-1].sha); code != http.StatusNotFound {
+			t.Errorf("GET of the dropped blob = %d; want 404", code)
+		}
 		synctest.Wait()
 	})
 }
