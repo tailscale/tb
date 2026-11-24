@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -155,6 +156,73 @@ func TestStaticPair(t *testing.T) {
 			t.Errorf("snapshot after b left = %+v", snap)
 		}
 	})
+}
+
+// TestLANDial covers a process whose Dial may fetch adverts but may not
+// reach LAN TLS addresses, as with macOS local network privacy: LANDial
+// makes the LAN connections instead.
+func TestLANDial(t *testing.T) {
+	const advertPort = "7890"
+	errBlocked := errors.New("no route to host")
+	for _, withLANDial := range []bool{true, false} {
+		t.Run(fmt.Sprintf("LANDial=%v", withLANDial), func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				lan := new(lansporttest.LAN)
+				advA, advB := net.JoinHostPort(ipA.String(), advertPort), net.JoinHostPort(ipB.String(), advertPort)
+				dialA := lan.DialFrom(ipA)
+				var lanDials atomic.Int64
+				cfg := Config{
+					Source:         StaticSource("a", advB),
+					Name:           "a",
+					AdvertListener: lan.Listen(advA),
+					TLSListener:    lan.Listen(net.JoinHostPort(ipA.String(), "0")),
+					LANIP:          ipA,
+					Dial: func(ctx context.Context, network, addr string) (net.Conn, error) {
+						if _, port, _ := net.SplitHostPort(addr); port != advertPort {
+							return nil, errBlocked
+						}
+						return dialA(ctx, network, addr)
+					},
+					Handler:       echoName("a"),
+					ProbeInterval: probeInterval,
+					Logf:          func(f string, args ...any) { t.Logf("a: "+f, args...) },
+				}
+				if withLANDial {
+					cfg.LANDial = func(ctx context.Context, network, addr string) (net.Conn, error) {
+						lanDials.Add(1)
+						return dialA(ctx, network, addr)
+					}
+				}
+				a, err := Listen(cfg)
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { a.Close() })
+				newServer(t, lan, "b", ipB, advB, StaticSource("b", advA))
+				rounds(2)
+
+				pb, ok := a.Peers()["b"]
+				if !withLANDial {
+					if ok {
+						t.Fatalf("a reached b without LANDial")
+					}
+					if snap := a.Snapshot(); len(snap) != 1 || snap[0].LANErr == "" {
+						t.Errorf("snapshot = %+v, want a LAN error", snap)
+					}
+					return
+				}
+				if !ok {
+					t.Fatalf("a's peers = %v, want b; snapshot %+v", a.Peers(), a.Snapshot())
+				}
+				if code, body := get(t, pb, "/hello"); code != 200 || body != "b saw a" {
+					t.Errorf("GET via transport: %d %q", code, body)
+				}
+				if lanDials.Load() == 0 {
+					t.Error("LANDial was not used")
+				}
+			})
+		})
+	}
 }
 
 // TestRestartRepins covers a peer restarting: a new certificate behind the

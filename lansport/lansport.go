@@ -141,6 +141,12 @@ type Config struct {
 	// in-memory network; see the lansporttest package.
 	Dial netx.DialFunc
 
+	// LANDial, if non-nil, replaces Dial for connections to peers' LAN TLS
+	// addresses, but not for advert fetches. On macOS, a non-root daemon
+	// can set it to a lanlord.Client's DialContext, since local network
+	// privacy blocks its own LAN dials but not its tailnet dials.
+	LANDial netx.DialFunc
+
 	// ResponseHeaderTimeout bounds how long requests through a peer's
 	// Transport wait for response headers. If zero, 30 seconds.
 	ResponseHeaderTimeout time.Duration
@@ -266,6 +272,9 @@ func Listen(cfg Config) (*Server, error) {
 	}
 	if cfg.Dial == nil {
 		cfg.Dial = (&net.Dialer{Timeout: probeTimeout, KeepAlive: 30 * time.Second}).DialContext
+	}
+	if cfg.LANDial == nil {
+		cfg.LANDial = cfg.Dial
 	}
 	identity, err := NewIdentity(cfg.Name)
 	if err != nil {
@@ -701,7 +710,7 @@ func (s *Server) checkLAN(ctx context.Context, transport *http.Transport, want *
 func (s *Server) newTransport(ipPort string, pin Pin) *http.Transport {
 	return &http.Transport{
 		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
-			return s.cfg.Dial(ctx, "tcp", ipPort)
+			return s.cfg.LANDial(ctx, "tcp", ipPort)
 		},
 		TLSClientConfig:       s.identity.ClientTLSConfig(&pin),
 		MaxIdleConnsPerHost:   64,

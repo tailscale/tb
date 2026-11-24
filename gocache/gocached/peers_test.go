@@ -8,6 +8,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"maps"
@@ -17,6 +18,7 @@ import (
 	"net/netip"
 	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -73,13 +75,16 @@ type peerTester struct {
 }
 
 // newPeerTester starts a peering server at ip on lan. cfg.Name is required;
-// the listeners, LAN address, and dialer are filled in from ip.
+// the listeners and LAN address are filled in from ip, and so is the dialer
+// unless cfg.Dial is set.
 func newPeerTester(t testing.TB, lan *lansporttest.LAN, ip netip.Addr, cfg PeerConfig) *peerTester {
 	t.Helper()
 	cfg.AdvertListener = lan.Listen(net.JoinHostPort(ip.String(), testAdvertPort))
 	cfg.TLSListener = lan.Listen(net.JoinHostPort(ip.String(), testTLSPort))
 	cfg.LANIP = ip.String()
-	cfg.Dial = lan.DialFrom(ip)
+	if cfg.Dial == nil {
+		cfg.Dial = lan.DialFrom(ip)
+	}
 	srv, err := NewServer(
 		WithDir(t.TempDir()),
 		WithLogf(func(format string, args ...any) { t.Logf(cfg.Name+": "+format, args...) }),
@@ -436,6 +441,48 @@ func ownedObjects(t testing.TB, ps *peerSet, name string) (small, big testObject
 	}
 	t.Fatalf("no small and big objects owned by %s found", name)
 	panic("unreachable")
+}
+
+// TestPeeringLANDial covers a server whose Dial may fetch adverts but may
+// not reach peers' LAN TLS ports, as with macOS local network privacy: its
+// LANDial makes those connections, so it still peers and forwards.
+func TestPeeringLANDial(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		lan := new(lansporttest.LAN)
+		advA := net.JoinHostPort(ipA.String(), testAdvertPort)
+		advB := net.JoinHostPort(ipB.String(), testAdvertPort)
+		dialA := lan.DialFrom(ipA)
+		var lanDials atomic.Int64
+		a := newPeerTester(t, lan, ipA, PeerConfig{
+			Name:  "a",
+			Peers: []string{advB},
+			Dial: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				if _, port, _ := net.SplitHostPort(addr); port != testAdvertPort {
+					return nil, errors.New("no route to host")
+				}
+				return dialA(ctx, network, addr)
+			},
+			LANDial: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				lanDials.Add(1)
+				return dialA(ctx, network, addr)
+			},
+		})
+		b := newPeerTester(t, lan, ipB, PeerConfig{Name: "b", Peers: []string{advA}})
+		sleepAndWait(2 * probeInterval) // See newPeerPair.
+		if !membersAre(a.srv.peers, "a", "b") {
+			t.Fatalf("a routes over %v, want [a b]", a.srv.peers.router.Members())
+		}
+		_, big := ownedObjects(t, a.srv.peers, "b")
+		if code := a.put(big, nil); code != http.StatusNoContent {
+			t.Fatalf("PUT via a: status %d", code)
+		}
+		if code, _, _ := b.get(big.actionID, localOnly); code != http.StatusOK {
+			t.Errorf("b does not have the object a forwarded: status %d", code)
+		}
+		if lanDials.Load() == 0 {
+			t.Error("LANDial was not used")
+		}
+	})
 }
 
 // TestPeeringUnreachableOwner covers forwards to a peer that the router

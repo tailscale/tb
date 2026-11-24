@@ -19,6 +19,7 @@ import (
 	"github.com/bradfitz/parentdeath"
 	"github.com/tailscale/tb/gocache/gocached"
 	_ "modernc.org/sqlite"
+	"tailscale.com/net/netx"
 )
 
 var (
@@ -49,11 +50,16 @@ var (
 	peerLANIP        = flag.String("peer-lan-ip", "", "IPv4 address peers should reach this server's --peer-tls-listen port at; defaults to the address of the interface with the default route")
 	peerWeight       = flag.Float64("peer-weight", 1, "this server's share of the pool's keyspace relative to peers with weight 1")
 	tailscaledSocket = flag.String("tailscaled-socket", "", "path of tailscaled's LocalAPI socket, for --peer-tag; defaults to the platform's usual location, including the macOS GUI variants")
+	peerLanlord      = flag.String("peer-lanlord-socket", "", "if non-empty, the unix socket of a root lanlord daemon (such as /var/run/lanlord.sock) that dials this server's LAN connections to peers; for non-root daemons on macOS, whose local network privacy blocks their own LAN dials. Unix only")
 	// See example GitHub token claims for what can be available:
 	// https://docs.github.com/en/actions/concepts/security/openid-connect
 	jwtClaims       = make(jwtClaimValue)
 	globalJWTClaims = make(jwtClaimValue)
 )
+
+// lanlordDialer, if non-nil, returns a dialer that asks the lanlord daemon
+// at socket for LAN connections. It is nil where lanlord is unsupported.
+var lanlordDialer func(socket string) netx.DialFunc
 
 type jwtClaimValue map[string]string
 
@@ -118,6 +124,12 @@ func main() {
 		}
 		if *peerList != "" {
 			pc.Peers = strings.Split(*peerList, ",")
+		}
+		if *peerLanlord != "" {
+			if lanlordDialer == nil {
+				log.Fatal("--peer-lanlord-socket: lanlord is only supported on unix")
+			}
+			pc.LANDial = lanlordDialer(*peerLanlord)
 		}
 		opts = append(opts, gocached.WithPeers(pc))
 	}

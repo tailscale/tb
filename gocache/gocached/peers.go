@@ -125,6 +125,11 @@ type PeerConfig struct {
 	// run whole pools on an in-memory network.
 	Dial netx.DialFunc
 
+	// LANDial, if non-nil, replaces Dial for forwarding to peers over the
+	// LAN, but not for fetching their adverts. On macOS, a non-root daemon
+	// sets it to a lanlord.Client's DialContext; see lansport.Config.LANDial.
+	LANDial netx.DialFunc
+
 	// Weight is this server's share of the keyspace relative to peers with
 	// weight 1. If zero, 1 is used.
 	Weight float64
@@ -294,6 +299,7 @@ func newPeerSet(srv *Server, cfg PeerConfig) (*peerSet, error) {
 		TLSListener:    cfg.TLSListener,
 		LANIP:          lanIP,
 		Dial:           cfg.Dial,
+		LANDial:        cfg.LANDial,
 		Handler:        srv,
 		ProbeInterval:  srv.peerPollInterval,
 		// A forwarded PUT can sit in the peer's put-queue backpressure
