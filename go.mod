@@ -19,6 +19,7 @@ require (
 	github.com/prometheus/client_golang v1.24.1
 	github.com/prometheus/client_model v0.6.3
 	github.com/tailscale/netlink v1.1.1-0.20240822203006-4d49adab4de7
+	github.com/tailscale/peercred v0.0.0-20250107143737-35a0c7bd7edc
 	golang.org/x/net v0.62.0
 	golang.org/x/sync v0.25.0
 	golang.org/x/sys v0.50.0
