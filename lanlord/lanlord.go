@@ -33,6 +33,7 @@ import (
 	"os"
 	"os/user"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/tailscale/peercred"
@@ -107,18 +108,21 @@ func Listen(path string) (*net.UnixListener, error) {
 	return ln, nil
 }
 
-// Serve accepts and serves requests on ln until ln fails. It fails at once
-// if s.Allow is nil.
+// Serve accepts and serves requests on ln until ln is closed. Then it waits
+// for the requests in progress to finish, and returns the error from ln.
+// Serve fails at once if s.Allow is nil.
 func (s *Server) Serve(ln *net.UnixListener) error {
 	if s.Allow == nil {
 		return errors.New("lanlord: Server.Allow is required")
 	}
+	var wg sync.WaitGroup
+	defer wg.Wait()
 	for {
 		c, err := ln.AcceptUnix()
 		if err != nil {
 			return err
 		}
-		go s.serveConn(c)
+		wg.Go(func() { s.serveConn(c) })
 	}
 }
 

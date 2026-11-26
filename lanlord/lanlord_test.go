@@ -41,11 +41,17 @@ func startServer(t *testing.T, s *Server) *Client {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { ln.Close() })
 	if s.Logf == nil {
 		s.Logf = t.Logf
 	}
-	go s.Serve(ln)
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- s.Serve(ln) }()
+	t.Cleanup(func() {
+		ln.Close()
+		if err := <-serveErr; !errors.Is(err, net.ErrClosed) {
+			t.Errorf("Serve = %v, want net.ErrClosed", err)
+		}
+	})
 	return &Client{Socket: path}
 }
 
@@ -174,6 +180,57 @@ func TestAllowUsers(t *testing.T) {
 				t.Error("root not allowed")
 			}
 		})
+	}
+}
+
+func TestServeWaitsForRequests(t *testing.T) {
+	path := shortSocketPath(t)
+	ln, err := Listen(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	dialing := make(chan struct{})
+	release := make(chan struct{})
+	s := &Server{
+		AllowUsers: set.Of(myUID()),
+		Allow:      allowLoopback,
+		Dial: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			close(dialing)
+			<-release
+			return nil, errors.New("released")
+		},
+		Logf: t.Logf,
+	}
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- s.Serve(ln) }()
+
+	c := &Client{Socket: path}
+	dialErr := make(chan error, 1)
+	go func() {
+		_, err := c.DialContext(context.Background(), "tcp4", "127.0.0.1:1")
+		dialErr <- err
+	}()
+	<-dialing
+
+	// Close the listener. The request is still in Dial, so Serve must not
+	// return yet.
+	ln.Close()
+	if _, err := c.DialContext(context.Background(), "tcp4", "127.0.0.1:1"); err == nil {
+		t.Fatal("DialContext after closing the listener succeeded")
+	}
+	select {
+	case err := <-serveErr:
+		t.Fatalf("Serve returned %v while a request was in progress", err)
+	default:
+	}
+
+	close(release)
+	if err := <-serveErr; !errors.Is(err, net.ErrClosed) {
+		t.Errorf("Serve = %v, want net.ErrClosed", err)
+	}
+	if err := <-dialErr; err == nil || !strings.Contains(err.Error(), "released") {
+		t.Errorf("DialContext in progress = %v, want the dial error", err)
 	}
 }
 
