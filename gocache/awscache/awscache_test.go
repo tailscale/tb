@@ -296,8 +296,9 @@ var writeGlobal = Grant{CanWrite: true}
 
 func TestRoundTrip(t *testing.T) {
 	env := newTestEnv(t)
-	writer := env.newClient(env.newCache(nil), writeGlobal)
-	reader := env.newClient(env.newCache(nil), Grant{}) // another host
+	wc, rc := env.newCache(nil), env.newCache(nil) // rc is another host
+	writer := env.newClient(wc, writeGlobal)
+	reader := env.newClient(rc, Grant{})
 
 	objs := map[string][]byte{
 		"aaaa01": nil,                                       // empty, inline
@@ -334,6 +335,25 @@ func TestRoundTrip(t *testing.T) {
 	st = writer.h.Stats()
 	if st.Puts != 4 || st.PutsInline != 2 || st.PutErrs != 0 || st.PutsDup != 0 {
 		t.Errorf("writer stats = %+v", st)
+	}
+
+	// PUT bodies arrive uncompressed. GET responses are counted as sent,
+	// and the client accepts lz4, so the compressible blob is sent smaller.
+	inlineBytes := float64(len(objs["aaaa01"]) + len(objs["aaaa02"]))
+	blobBytes := float64(len(objs["aaaa03"]) + len(objs["aaaa04"]))
+	putBody := func(storage string) float64 { return testutil.ToFloat64(wc.m.putBodyBytes.WithLabelValues(storage)) }
+	if got := putBody("inline"); got != inlineBytes {
+		t.Errorf("put body bytes, inline = %v; want %v", got, inlineBytes)
+	}
+	if got := putBody("s3"); got != blobBytes {
+		t.Errorf("put body bytes, s3 = %v; want %v", got, blobBytes)
+	}
+	getResp := func(storage string) float64 { return testutil.ToFloat64(rc.m.getRespBytes.WithLabelValues(storage)) }
+	if got, want := getResp("inline")+getResp("s3"), float64(reader.h.Stats().GetBytes); got != want {
+		t.Errorf("get response bytes = %v; want %v, the bytes the handler sent", got, want)
+	}
+	if got := getResp("s3"); got <= 0 || got >= blobBytes {
+		t.Errorf("get response bytes, s3 = %v; want lz4-compressed, under the %v uncompressed", got, blobBytes)
 	}
 }
 
