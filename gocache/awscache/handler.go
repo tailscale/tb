@@ -203,6 +203,7 @@ func (h *Handler) serveGet(w http.ResponseWriter, r *http.Request) {
 	}
 	n, err := io.Copy(w, body)
 	h.st.getBytes.Add(n)
+	c.m.getRespBytes.WithLabelValues(o.storage).Add(float64(n))
 	if err != nil && r.Context().Err() == nil {
 		// Headers are already sent, so all we can do is cut the response
 		// short; the client sees a short body and errors.
@@ -283,6 +284,7 @@ func (h *Handler) servePut(w http.ResponseWriter, r *http.Request) {
 			h.st.putsInline.Add(1)
 		}
 		c.m.objectBytes.WithLabelValues("put").Observe(float64(size))
+		c.m.putBodyBytes.WithLabelValues(res.storage).Add(float64(size))
 	} else {
 		typ = "dup"
 		h.st.putsDup.Add(1)

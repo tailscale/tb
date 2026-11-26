@@ -17,6 +17,8 @@ type metrics struct {
 	getDuration     *prometheus.HistogramVec // storage, type
 	putDuration     *prometheus.HistogramVec // storage, type
 	objectBytes     *prometheus.HistogramVec // op
+	getRespBytes    *prometheus.CounterVec   // storage
+	putBodyBytes    *prometheus.CounterVec   // storage
 	activeGets      prometheus.Gauge
 	activePuts      prometheus.Gauge
 	danglingActions prometheus.Counter
@@ -57,6 +59,14 @@ func newMetrics() *metrics {
 			Help:    "uncompressed sizes of objects returned by get hits and stored by puts, labeled by op",
 			Buckets: prometheus.ExponentialBuckets(64, 4, 13), // 64B to 1GiB
 		}, []string{"op"}),
+		getRespBytes: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "gocache_aws_get_response_bytes_total",
+			Help: "body bytes sent in get hit responses, as sent (lz4-compressed if the client accepts lz4), labeled by storage (inline, blobserver, or s3)",
+		}, []string{"storage"}),
+		putBodyBytes: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "gocache_aws_put_body_bytes_total",
+			Help: "body bytes received in puts that weren't duplicates, as clients send them (uncompressed), labeled by storage (inline or s3)",
+		}, []string{"storage"}),
 		activeGets: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "gocache_aws_active_gets",
 			Help: "currently pending gets",
@@ -119,6 +129,7 @@ func newMetrics() *metrics {
 func (m *metrics) collectors() []prometheus.Collector {
 	return []prometheus.Collector{
 		m.opDuration, m.getDuration, m.putDuration, m.objectBytes,
+		m.getRespBytes, m.putBodyBytes,
 		m.activeGets, m.activePuts, m.danglingActions, m.corruptBlobs,
 		m.poolFallbacks,
 		m.blobUploads, m.blobUploadBytes, m.blobSkips, m.spoolBytes,
