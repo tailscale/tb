@@ -283,15 +283,22 @@ func (c *Client) DialContext(ctx context.Context, network, addr string) (net.Con
 		return nil
 	}
 
-	if _, err := io.WriteString(uc, reqPrefix+ap.String()+"\n"); err != nil {
-		if cerr := ctxErr(err); cerr != nil {
+	// The server may refuse before reading the request, replying and
+	// closing while the request is still being written. The write then
+	// fails, but the refusal is still there to read, so a failed write
+	// is reported only if no reply follows.
+	_, writeErr := io.WriteString(uc, reqPrefix+ap.String()+"\n")
+	if writeErr != nil {
+		if cerr := ctxErr(writeErr); cerr != nil {
 			return nil, cerr
 		}
-		return nil, fmt.Errorf("lanlord: sending request: %w", err)
 	}
 	buf := make([]byte, maxLine)
 	oob := make([]byte, unix.CmsgSpace(4))
 	n, oobn, _, _, err := uc.(*net.UnixConn).ReadMsgUnix(buf, oob)
+	if writeErr != nil && (err != nil || n == 0) {
+		return nil, fmt.Errorf("lanlord: sending request: %w", writeErr)
+	}
 	if err != nil {
 		if cerr := ctxErr(err); cerr != nil {
 			return nil, cerr
